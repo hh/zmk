@@ -29,6 +29,8 @@
 #include <zmk/events/usb_conn_state_changed.h>
 #include <zmk/events/ble_active_profile_changed.h>
 #include <zmk/events/hid_indicators_changed.h>
+#include <zmk/events/layer_state_changed.h>
+#include <zmk/keymap.h>
 #include <zmk/workqueue.h>
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
@@ -54,12 +56,14 @@ struct zmk_stp_ble {
 
 static struct zmk_led_hsb color0; // BLE Led
 static struct zmk_led_hsb color1; // Caps
+static struct zmk_led_hsb color2; // Layer
 
 static struct zmk_stp_ble ble_status;
 static bool caps;
 static bool usb;
 static bool battery;
 static bool events_en;
+static uint8_t active_layer;
 
 static bool on;
 
@@ -157,7 +161,8 @@ static void zmk_stp_indicators_blink_work(struct k_work *work) {
     else
         color0.b = CONFIG_ZMK_STP_INDICATORS_BRT_MAX;
     // Convert HSB to RGB and update LEDs
-    pixels[0] = hsb_to_rgb(color0);
+    // Adv360 LED order: pixels[0]=left(caps), pixels[1]=middle(BLE), pixels[2]=right(layer)
+    pixels[1] = hsb_to_rgb(color0);
     int err = led_strip_update_rgb(led_strip, pixels, STRIP_NUM_PIXELS);
     if (err < 0) {
         LOG_ERR("Failed to update the RGB strip (%d)", err);
@@ -218,8 +223,8 @@ static void zmk_stp_indicators_bluetooth(struct k_work *work) {
         k_timer_start(&connected_timeout_timer, K_SECONDS(3), K_NO_WAIT);
     }
     // Convert HSB to RGB and update the LEDs
-
-    pixels[0] = hsb_to_rgb(color0);
+    // Adv360 LED order: pixels[0]=left(caps), pixels[1]=middle(BLE), pixels[2]=right(layer)
+    pixels[1] = hsb_to_rgb(color0);
     int err = led_strip_update_rgb(led_strip, pixels, STRIP_NUM_PIXELS);
     if (err < 0) {
         LOG_ERR("Failed to update the RGB strip (%d)", err);
@@ -241,7 +246,32 @@ static void zmk_stp_indicators_caps(struct k_work *work) {
     else
         color1.b = 0;
     // Convert HSB to RGB and update the LEDs
-    pixels[1] = hsb_to_rgb(color1);
+    // Adv360 LED order: pixels[0]=left(caps), pixels[1]=middle(BLE), pixels[2]=right(layer)
+    pixels[0] = hsb_to_rgb(color1);
+    int err = led_strip_update_rgb(led_strip, pixels, STRIP_NUM_PIXELS);
+    if (err < 0) {
+        LOG_ERR("Failed to update the RGB strip (%d)", err);
+    }
+}
+
+static void zmk_stp_indicators_layer(struct k_work *work) {
+    // Layer 0: off, Layer 1+: colored based on layer
+    // Colors: Layer 1=red(0), Layer 2=orange(30), Layer 3=yellow(60), Layer 4=green(120), Layer 5=cyan(180), Layer 6+=purple(280)
+    if (active_layer == 0) {
+        color2.b = 0;
+    } else {
+        color2.b = CONFIG_ZMK_STP_INDICATORS_BRT_MAX;
+        switch (active_layer) {
+            case 1: color2.h = 0; color2.s = 100; break;    // Red
+            case 2: color2.h = 30; color2.s = 100; break;   // Orange
+            case 3: color2.h = 60; color2.s = 100; break;   // Yellow
+            case 4: color2.h = 120; color2.s = 100; break;  // Green
+            case 5: color2.h = 180; color2.s = 100; break;  // Cyan
+            default: color2.h = 280; color2.s = 100; break; // Purple
+        }
+    }
+    // Adv360 LED order: pixels[2]=right(layer)
+    pixels[2] = hsb_to_rgb(color2);
     int err = led_strip_update_rgb(led_strip, pixels, STRIP_NUM_PIXELS);
     if (err < 0) {
         LOG_ERR("Failed to update the RGB strip (%d)", err);
@@ -252,6 +282,7 @@ static void zmk_stp_indicators_caps(struct k_work *work) {
 K_WORK_DEFINE(battery_ind_work, zmk_stp_indicators_batt);
 K_WORK_DEFINE(bluetooth_ind_work, zmk_stp_indicators_bluetooth);
 K_WORK_DEFINE(caps_ind_work, zmk_stp_indicators_caps);
+K_WORK_DEFINE(layer_ind_work, zmk_stp_indicators_layer);
 
 int zmk_stp_indicators_enable_batt() {
     // Stop blinking timers
@@ -286,9 +317,11 @@ static int zmk_stp_indicators_resample(void) {
     };
     caps = (zmk_hid_indicators_get_current_profile() & ZMK_LED_CAPSLOCK_BIT);
     usb = zmk_usb_is_powered();
+    active_layer = zmk_keymap_highest_layer_active();
 
     k_work_submit_to_queue(zmk_workqueue_lowprio_work_q(), &bluetooth_ind_work);
     k_work_submit_to_queue(zmk_workqueue_lowprio_work_q(), &caps_ind_work);
+    k_work_submit_to_queue(zmk_workqueue_lowprio_work_q(), &layer_ind_work);
 }
 
 static void zmk_stp_indicators_resample_work(struct k_work *work) {
@@ -359,6 +392,7 @@ int zmk_stp_indicators_on() {
 
     k_work_submit_to_queue(zmk_workqueue_lowprio_work_q(), &bluetooth_ind_work);
     k_work_submit_to_queue(zmk_workqueue_lowprio_work_q(), &caps_ind_work);
+    k_work_submit_to_queue(zmk_workqueue_lowprio_work_q(), &layer_ind_work);
 
     return 0;
 }
@@ -457,6 +491,16 @@ static int stp_indicators_event_listener(const zmk_event_t *eh) {
         return 0;
     }
 
+    // If layer state changed
+    if (as_zmk_layer_state_changed(eh) && events_en) {
+        active_layer = zmk_keymap_highest_layer_active();
+        LOG_DBG("LAYER CHANGED: %d", active_layer);
+        if (!battery) {
+            k_work_submit_to_queue(zmk_workqueue_lowprio_work_q(), &layer_ind_work);
+        }
+        return 0;
+    }
+
     return -ENOTSUP;
 }
 
@@ -466,5 +510,6 @@ ZMK_SUBSCRIPTION(stp_indicators, zmk_activity_state_changed);
 ZMK_SUBSCRIPTION(stp_indicators, zmk_usb_conn_state_changed);
 ZMK_SUBSCRIPTION(stp_indicators, zmk_ble_active_profile_changed);
 ZMK_SUBSCRIPTION(stp_indicators, zmk_hid_indicators_changed);
+ZMK_SUBSCRIPTION(stp_indicators, zmk_layer_state_changed);
 
 SYS_INIT(zmk_stp_indicators_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
