@@ -26,6 +26,8 @@
 #include <zmk/events/ble_active_profile_changed.h>
 #include <zmk/endpoints.h>
 #include <zmk/endpoints_types.h>
+#include <zmk/ble.h>
+#include <zephyr/bluetooth/bluetooth.h>
 
 LOG_MODULE_REGISTER(serial_cmd, CONFIG_LOG_DEFAULT_LEVEL);
 
@@ -90,6 +92,11 @@ static void process_command(const char *cmd) {
 #endif
     } else if (strncmp(cmd, "split", 5) == 0 || strncmp(cmd, "right", 5) == 0) {
         LOG_INF("Split status not implemented yet");
+    } else if (strncmp(cmd, "forget", 6) == 0 || strncmp(cmd, "clear", 5) == 0) {
+        /* Clear all BLE profile bonds (but NOT split connection) */
+        LOG_INF("Clearing all BLE profile bonds...");
+        zmk_ble_clear_all_bonds();
+        LOG_INF("Bonds cleared. Re-pair with host to reconnect.");
     } else if (strncmp(cmd, "ble", 3) == 0) {
         LOG_INF("Switching to BLE output...");
         zmk_endpoints_select_transport(ZMK_TRANSPORT_BLE);
