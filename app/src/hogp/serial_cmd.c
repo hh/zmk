@@ -14,7 +14,8 @@
  *   !pair    - Enter HOGP pairing mode (if HOGP enabled)
  *   !unpair  - Exit HOGP pairing mode
  *   !hogp    - Show HOGP status
- *   !clear   - Clear HOGP device bonds
+ *   !clear   - Clear HOGP device bonds (preserves host bonds)
+ *   !clearhosts - Clear host bonds (preserves HOGP bonds)
  *   !help    - Show available commands
  *
  * Also broadcasts BT profile changes for external bridge sync:
@@ -28,6 +29,8 @@
 #include <zephyr/logging/log.h>
 
 #include <string.h>
+
+#include <zephyr/bluetooth/bluetooth.h>
 
 #include <zmk/event_manager.h>
 #include <zmk/events/ble_active_profile_changed.h>
@@ -93,6 +96,16 @@ static void process_command(const char *cmd) {
         LOG_INF("Switching to USB output...");
         zmk_endpoints_select_transport(ZMK_TRANSPORT_USB);
 
+    } else if (strncmp(cmd, "nuke", 4) == 0) {
+        /* Nuclear option: clear ALL bonds via bt_unpair */
+        LOG_INF("NUKING all BLE bonds (bt_unpair NULL)...");
+        int err = bt_unpair(BT_ID_DEFAULT, NULL);
+        if (err) {
+            LOG_ERR("bt_unpair failed: %d", err);
+        } else {
+            LOG_INF("All bonds nuked. Re-pair everything.");
+        }
+
     } else if (strncmp(cmd, "forget", 6) == 0) {
         /* Clear BLE profile bonds (but NOT split connection) */
         LOG_INF("Clearing all BLE profile bonds...");
@@ -111,15 +124,22 @@ static void process_command(const char *cmd) {
     } else if (strncmp(cmd, "hogp", 4) == 0 || strncmp(cmd, "status", 6) == 0) {
         hogp_print_status();
 
+    } else if (strncmp(cmd, "clearhosts", 10) == 0) {
+        LOG_INF("Clearing host bonds only (HOGP preserved)...");
+        hogp_clear_host_bonds();
+
     } else if (strncmp(cmd, "clear", 5) == 0) {
-        LOG_INF("Clearing all HOGP bonds...");
+        LOG_INF("Clearing HOGP bonds only (hosts preserved)...");
         hogp_clear_bonds();
+
+    } else if (strncmp(cmd, "nvs", 3) == 0) {
+        hogp_dump_nvs_state();
 #endif /* CONFIG_ZMK_HOGP */
 
     } else if (strncmp(cmd, "help", 4) == 0) {
         LOG_INF("Commands: !reboot, !boot, !ble, !usb, !forget"
 #if IS_ENABLED(CONFIG_ZMK_HOGP)
-                ", !pair, !unpair, !hogp, !clear"
+                ", !pair, !unpair, !hogp, !clear, !clearhosts"
 #endif
                 ", !help");
 

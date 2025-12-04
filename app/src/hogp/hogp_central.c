@@ -26,6 +26,7 @@
 #include <zephyr/bluetooth/hci.h>
 
 #include <zephyr/logging/log.h>
+#include <zephyr/settings/settings.h>
 
 #include <zmk/hogp/hogp.h>
 
@@ -102,9 +103,15 @@ K_WORK_DELAYABLE_DEFINE(hogp_auto_reconnect_work, hogp_auto_reconnect_work_handl
 #define HOGP_AUTO_RECONNECT_DELAY_MS 5000
 /* How long to scan for bonded devices during auto-reconnect (seconds) */
 #define HOGP_AUTO_RECONNECT_SCAN_SEC 10
+/* Periodic reconnect check interval (seconds) */
+#define HOGP_PERIODIC_RECONNECT_SEC 60
 
-/* Forward declaration */
+/* Forward declarations */
 static void hogp_do_subscribe(struct hogp_device *dev);
+static int hogp_reconnect_bonded_devices(void);
+static struct hogp_device *hogp_get_free_slot(void);
+static void hogp_remember_addr(const bt_addr_le_t *addr);
+static bool hogp_is_remembered_addr(const bt_addr_le_t *addr);
 
 /* Work handler to subscribe to reports (deferred from security callback) */
 static void hogp_subscribe_work_handler(struct k_work *work) {
@@ -480,33 +487,64 @@ static void hogp_pairing_timeout_work_handler(struct k_work *work) {
  * Auto-reconnect work handler
  */
 static void hogp_auto_reconnect_work_handler(struct k_work *work) {
+    bool need_reconnect = false;
+    bool all_ready = true;
+
     if (hogp_pairing_mode) {
-        LOG_DBG("Auto-reconnect: already in pairing mode");
+        LOG_DBG("Auto-reconnect: already in pairing mode, will retry later");
+        k_work_schedule(&hogp_auto_reconnect_work, K_SECONDS(HOGP_PERIODIC_RECONNECT_SEC));
         return;
     }
 
-    /* Check if we already have a connected device */
+    /* Check device states */
     for (int i = 0; i < CONFIG_ZMK_HOGP_MAX_DEVICES; i++) {
-        if (hogp_devices[i].state >= HOGP_STATE_CONNECTED) {
-            LOG_DBG("Auto-reconnect: already connected");
-            return;
+        if (hogp_devices[i].state == HOGP_STATE_READY) {
+            /* Device is working, nothing to do */
+            continue;
+        } else if (hogp_devices[i].state >= HOGP_STATE_CONNECTED) {
+            /* Connected but not ready - might be stuck */
+            LOG_INF("Auto-reconnect: slot %d in state %d, not READY", i, hogp_devices[i].state);
+            all_ready = false;
+        } else if (hogp_devices[i].state != HOGP_STATE_IDLE) {
+            /* In some transitional state */
+            all_ready = false;
+        } else {
+            /* IDLE - check if we have a bond to reconnect to */
+            all_ready = false;
+            need_reconnect = true;
         }
     }
 
-#if IS_ENABLED(CONFIG_ZMK_HOGP_AUTO_RECONNECT)
-    LOG_INF("Auto-reconnect: scanning for bonded HOGP devices...");
-
-    hogp_pairing_mode = true;
-    int err = hogp_start_scan();
-    if (err) {
-        LOG_WRN("Auto-reconnect scan failed: %d", err);
-        hogp_pairing_mode = false;
-        k_work_schedule(&hogp_auto_reconnect_work, K_SECONDS(30));
+    /* If all slots are READY, just schedule next check and return */
+    if (all_ready) {
+        LOG_DBG("Auto-reconnect: all devices ready");
+        k_work_schedule(&hogp_auto_reconnect_work, K_SECONDS(HOGP_PERIODIC_RECONNECT_SEC));
         return;
     }
 
-    k_work_schedule(&hogp_pairing_timeout_work, K_SECONDS(HOGP_AUTO_RECONNECT_SCAN_SEC));
+#if IS_ENABLED(CONFIG_ZMK_HOGP_AUTO_RECONNECT)
+    if (need_reconnect) {
+        /* First try direct connection to bonded devices (faster, no scan needed) */
+        LOG_INF("Auto-reconnect: trying direct connection to bonded devices...");
+        int connected = hogp_reconnect_bonded_devices();
+
+        if (connected == 0) {
+            /* No bonded devices found, fall back to scanning */
+            LOG_INF("Auto-reconnect: no bonded devices, scanning...");
+            hogp_pairing_mode = true;
+            int err = hogp_start_scan();
+            if (err) {
+                LOG_WRN("Auto-reconnect scan failed: %d", err);
+                hogp_pairing_mode = false;
+            } else {
+                k_work_schedule(&hogp_pairing_timeout_work, K_SECONDS(HOGP_AUTO_RECONNECT_SCAN_SEC));
+            }
+        }
+    }
 #endif
+
+    /* Always schedule next periodic check */
+    k_work_schedule(&hogp_auto_reconnect_work, K_SECONDS(HOGP_PERIODIC_RECONNECT_SEC));
 }
 
 /*
@@ -515,6 +553,7 @@ static void hogp_auto_reconnect_work_handler(struct k_work *work) {
 static void hogp_do_subscribe(struct hogp_device *dev) {
     memset(&dev->report_subscribe_params, 0, sizeof(dev->report_subscribe_params));
     dev->report_subscribe_params.notify = hogp_report_notify_cb;
+    dev->report_subscribe_params.subscribe = hogp_subscribe_cb;  /* Called when subscription completes */
     dev->report_subscribe_params.value = BT_GATT_CCC_NOTIFY;
     dev->report_subscribe_params.value_handle = dev->report_handle;
     dev->report_subscribe_params.ccc_handle = 0;
@@ -580,26 +619,9 @@ static uint8_t hogp_discover_cb(struct bt_conn *conn,
 
     if (!attr) {
         if (dev->discover_phase == HOGP_DISCOVER_SERVICE) {
-            if (dev->service_start_handle == 0) {
-                LOG_WRN("HID service not found - not an HID device");
-                bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-                return BT_GATT_ITER_STOP;
-            }
-
-            LOG_INF("HID service found (0x%04x-0x%04x), discovering characteristics...",
-                    dev->service_start_handle, dev->service_end_handle);
-
-            dev->discover_phase = HOGP_DISCOVER_CHARACTERISTICS;
-            dev->discover_params.uuid = &hid_report_uuid.uuid;
-            dev->discover_params.start_handle = dev->service_start_handle;
-            dev->discover_params.end_handle = dev->service_end_handle;
-            dev->discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
-
-            int err = bt_gatt_discover(dev->conn, &dev->discover_params);
-            if (err) {
-                LOG_ERR("Characteristic discovery failed (err %d)", err);
-                dev->state = HOGP_STATE_CONNECTED;
-            }
+            /* Discovery ended without finding HID service - not an HID device */
+            LOG_WRN("HID service not found - not an HID device");
+            bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
             return BT_GATT_ITER_STOP;
 
         } else if (dev->discover_phase == HOGP_DISCOVER_CHARACTERISTICS) {
@@ -622,21 +644,49 @@ static uint8_t hogp_discover_cb(struct bt_conn *conn,
         struct bt_gatt_service_val *service = attr->user_data;
         dev->service_start_handle = attr->handle;
         dev->service_end_handle = service->end_handle;
-        LOG_DBG("Found HID service: handles 0x%04x-0x%04x",
+        LOG_INF("Found HID service: handles 0x%04x-0x%04x - stopping to discover characteristics",
                 dev->service_start_handle, dev->service_end_handle);
-        return BT_GATT_ITER_CONTINUE;
+
+        /* IMPORTANT: Return STOP here, not CONTINUE.
+         * If we return CONTINUE, Zephyr will search for more HID services,
+         * and there's a race condition with incoming ATT requests from the
+         * peripheral that can cause the error response to be dropped.
+         * Instead, we stop here and manually start characteristic discovery.
+         */
+        dev->discover_phase = HOGP_DISCOVER_CHARACTERISTICS;
+        dev->discover_params.uuid = &hid_report_uuid.uuid;
+        dev->discover_params.start_handle = dev->service_start_handle;
+        dev->discover_params.end_handle = dev->service_end_handle;
+        dev->discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
+
+        int err = bt_gatt_discover(dev->conn, &dev->discover_params);
+        if (err) {
+            LOG_ERR("Characteristic discovery failed to start (err %d)", err);
+            dev->state = HOGP_STATE_CONNECTED;
+        }
+        return BT_GATT_ITER_STOP;
 
     } else if (dev->discover_phase == HOGP_DISCOVER_CHARACTERISTICS) {
         struct bt_gatt_chrc *chrc = attr->user_data;
-        LOG_INF("Found HID Report characteristic at handle 0x%04x (value: 0x%04x)",
-                attr->handle, chrc->value_handle);
+        static int report_count = 0;  /* Track which report we're on */
 
-        dev->report_handle = chrc->value_handle;
+        LOG_INF("Found HID Report #%d at handle 0x%04x (value: 0x%04x) props=0x%02x",
+                report_count + 1, attr->handle, chrc->value_handle, chrc->properties);
+
         if (chrc->properties & BT_GATT_CHRC_NOTIFY) {
-            LOG_INF("This report supports notifications - subscribing now");
-            dev->discover_phase = HOGP_DISCOVER_COMPLETE;
-            hogp_subscribe_to_reports(dev);
-            return BT_GATT_ITER_STOP;
+            report_count++;
+            /* M720 has 4 HID reports - the 2nd one (0x0030) is mouse input (7 bytes)
+             * Report #3 (0x0034) is Logitech HID++ protocol (19 bytes) - not standard mouse
+             */
+            if (report_count == 2) {
+                LOG_INF("This is report #2 (mouse input) - subscribing now");
+                dev->report_handle = chrc->value_handle;
+                dev->discover_phase = HOGP_DISCOVER_COMPLETE;
+                report_count = 0;  /* Reset for next device */
+                hogp_subscribe_to_reports(dev);
+                return BT_GATT_ITER_STOP;
+            }
+            LOG_INF("Skipping report #%d, looking for #2", report_count);
         }
         return BT_GATT_ITER_CONTINUE;
     }
@@ -771,14 +821,70 @@ static void hogp_security_changed(struct bt_conn *conn, bt_security_t level,
     LOG_INF("Security changed for %s: level %d", addr_str, level);
 
     if (dev->state == HOGP_STATE_CONNECTED && level >= BT_SECURITY_L2) {
-        LOG_INF("Security established (level %d), starting HID discovery...", level);
-        hogp_start_discovery(dev);
+        /* Check if this is a reconnection to an already-bonded device.
+         * If so, pairing_complete will NOT be called - start discovery now.
+         * For new pairing, pairing_complete will be called and we start there.
+         * We detect reconnection by checking if we already know this device. */
+        if (hogp_is_remembered_addr(&dev->addr)) {
+            /* Reconnection to known device - start discovery immediately */
+            LOG_INF("Reconnected to known bonded device, starting HID discovery...");
+            hogp_start_discovery(dev);
+        } else {
+            /* New pairing in progress - wait for pairing_complete callback.
+             * This avoids the Zephyr SMP bug where concurrent SMP and GATT ops fail. */
+            LOG_INF("Security level %d achieved, waiting for pairing_complete...", level);
+        }
     }
     else if (dev->state == HOGP_STATE_SUBSCRIBING && dev->report_handle && level >= BT_SECURITY_L2) {
         LOG_INF("Security established, subscribing to reports...");
         k_work_submit(&dev->subscribe_work);
     }
 }
+
+/*
+ * Pairing complete callback - SMP is truly finished, safe to start GATT discovery
+ */
+static void hogp_pairing_complete(struct bt_conn *conn, bool bonded) {
+    struct hogp_device *dev = hogp_device_for_conn(conn);
+    if (!dev) {
+        return;
+    }
+
+    char addr_str[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(&dev->addr, addr_str, sizeof(addr_str));
+    LOG_INF("Pairing complete for %s (bonded=%d)", addr_str, bonded);
+
+    /* Remember this address for auto-reconnect */
+    if (bonded) {
+        hogp_remember_addr(&dev->addr);
+        LOG_INF("Remembered HOGP device for auto-reconnect: %s", addr_str);
+    }
+
+    if (dev->state == HOGP_STATE_CONNECTED) {
+        LOG_INF("SMP finished, starting HID discovery...");
+        hogp_start_discovery(dev);
+    }
+}
+
+static void hogp_pairing_failed(struct bt_conn *conn, enum bt_security_err reason) {
+    struct hogp_device *dev = hogp_device_for_conn(conn);
+    if (!dev) {
+        return;
+    }
+
+    char addr_str[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(&dev->addr, addr_str, sizeof(addr_str));
+    LOG_WRN("Pairing failed for %s (reason %d), trying discovery anyway...", addr_str, reason);
+
+    if (dev->state == HOGP_STATE_CONNECTED) {
+        hogp_start_discovery(dev);
+    }
+}
+
+static struct bt_conn_auth_info_cb hogp_auth_info_cb = {
+    .pairing_complete = hogp_pairing_complete,
+    .pairing_failed = hogp_pairing_failed,
+};
 
 BT_CONN_CB_DEFINE(hogp_conn_callbacks) = {
     .connected = hogp_connected,
@@ -803,6 +909,19 @@ static const char *hogp_state_name(enum hogp_device_state state) {
 }
 
 /*
+ * Stored addresses of HOGP devices we've seen (for clearing bonds)
+ * We track these because RPA addresses change, but we store the bonded identity
+ * Persisted to NVS so reconnection works after keyboard reboot.
+ * NOTE: Declared here (before hogp_print_status) so hogp_dump_nvs_state can use them.
+ */
+static bt_addr_le_t hogp_known_addrs[CONFIG_ZMK_HOGP_MAX_DEVICES];
+static int hogp_known_addr_count = 0;
+static int hogp_settings_register_err = -999;  /* Track registration result */
+#if IS_ENABLED(CONFIG_SETTINGS)
+static bool hogp_settings_loaded = false;
+#endif
+
+/*
  * Print HOGP status
  */
 void hogp_print_status(void) {
@@ -825,34 +944,230 @@ void hogp_print_status(void) {
 }
 
 /*
- * Callback for bt_foreach_bond - unpair devices
+ * Dump NVS settings state for debugging
+ */
+void hogp_dump_nvs_state(void) {
+    LOG_INF("=== HOGP NVS State ===");
+    LOG_INF("settings_register err: %d", hogp_settings_register_err);
+#if IS_ENABLED(CONFIG_SETTINGS)
+    LOG_INF("settings_loaded: %s", hogp_settings_loaded ? "YES" : "NO");
+#else
+    LOG_INF("settings_loaded: N/A (CONFIG_SETTINGS disabled)");
+#endif
+    LOG_INF("known_addr_count: %d", hogp_known_addr_count);
+    for (int i = 0; i < hogp_known_addr_count; i++) {
+        char addr_str[BT_ADDR_LE_STR_LEN];
+        bt_addr_le_to_str(&hogp_known_addrs[i], addr_str, sizeof(addr_str));
+        LOG_INF("  addr[%d]: %s", i, addr_str);
+    }
+    LOG_INF("======================");
+}
+
+/*
+ * Check if address is a known HOGP device (in our slots or matches a slot's addr)
+ */
+static bool hogp_is_hogp_device_addr(const bt_addr_le_t *addr) {
+    for (int i = 0; i < CONFIG_ZMK_HOGP_MAX_DEVICES; i++) {
+        if (hogp_devices[i].state != HOGP_STATE_IDLE) {
+            if (bt_addr_le_cmp(&hogp_devices[i].addr, addr) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/*
+ * Save HOGP known addresses to NVS
+ */
+static void hogp_save_known_addrs(void) {
+#if IS_ENABLED(CONFIG_SETTINGS)
+    int err;
+    for (int i = 0; i < hogp_known_addr_count; i++) {
+        char setting_name[24];
+        snprintf(setting_name, sizeof(setting_name), "hogp/addr/%d", i);
+        err = settings_save_one(setting_name, &hogp_known_addrs[i], sizeof(bt_addr_le_t));
+        if (err) {
+            LOG_ERR("Failed to save %s: %d", setting_name, err);
+        }
+    }
+    /* Save the count */
+    err = settings_save_one("hogp/count", &hogp_known_addr_count, sizeof(hogp_known_addr_count));
+    if (err) {
+        LOG_ERR("Failed to save hogp/count: %d", err);
+    }
+    LOG_INF("Saved %d HOGP device addresses to NVS", hogp_known_addr_count);
+#endif
+}
+
+/*
+ * Remember an address as belonging to an HOGP device
+ */
+static void hogp_remember_addr(const bt_addr_le_t *addr) {
+    /* Check if already known */
+    for (int i = 0; i < hogp_known_addr_count; i++) {
+        if (bt_addr_le_cmp(&hogp_known_addrs[i], addr) == 0) {
+            return;  /* Already tracked */
+        }
+    }
+    /* Add if space available */
+    if (hogp_known_addr_count < CONFIG_ZMK_HOGP_MAX_DEVICES) {
+        bt_addr_le_copy(&hogp_known_addrs[hogp_known_addr_count++], addr);
+        char addr_str[BT_ADDR_LE_STR_LEN];
+        bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
+        LOG_INF("Remembering HOGP device: %s", addr_str);
+        /* Persist to NVS */
+        hogp_save_known_addrs();
+    }
+}
+
+/*
+ * Check if address is a remembered HOGP device
+ */
+static bool hogp_is_remembered_addr(const bt_addr_le_t *addr) {
+    for (int i = 0; i < hogp_known_addr_count; i++) {
+        if (bt_addr_le_cmp(&hogp_known_addrs[i], addr) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Try to directly connect to a remembered HOGP device address
+ */
+static int hogp_try_direct_connect(const bt_addr_le_t *addr) {
+    struct hogp_device *dev = hogp_get_free_slot();
+    if (!dev) {
+        LOG_WRN("No free HOGP slots for direct connect");
+        return -ENOMEM;
+    }
+
+    char addr_str[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
+    LOG_INF("Direct connect to bonded HOGP device: %s", addr_str);
+
+    dev->state = HOGP_STATE_CONNECTING;
+    bt_addr_le_copy(&dev->addr, addr);
+
+    int err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN,
+                                BT_LE_CONN_PARAM_DEFAULT, &dev->conn);
+    if (err) {
+        LOG_ERR("Direct connect failed (err %d)", err);
+        dev->state = HOGP_STATE_IDLE;
+        return err;
+    }
+
+    LOG_INF("Direct connection initiated to %s", addr_str);
+    return 0;
+}
+
+/*
+ * Callback for bt_foreach_bond to find and connect to HOGP devices
+ */
+struct hogp_reconnect_ctx {
+    int attempted;
+    int connected;
+};
+
+static void hogp_bond_reconnect_visitor(const struct bt_bond_info *info, void *user_data) {
+    struct hogp_reconnect_ctx *ctx = user_data;
+
+    /* Only try to connect to remembered HOGP devices */
+    if (!hogp_is_remembered_addr(&info->addr)) {
+        return;
+    }
+
+    /* Check if already connected to this device */
+    if (hogp_is_hogp_device_addr(&info->addr)) {
+        LOG_DBG("Already connected to this HOGP device");
+        return;
+    }
+
+    /* Check if we have a free slot */
+    struct hogp_device *free_slot = hogp_get_free_slot();
+    if (!free_slot) {
+        LOG_DBG("No free slots for reconnect");
+        return;
+    }
+
+    ctx->attempted++;
+    if (hogp_try_direct_connect(&info->addr) == 0) {
+        ctx->connected++;
+    }
+}
+
+/*
+ * Try to reconnect to all bonded HOGP devices
+ */
+static int hogp_reconnect_bonded_devices(void) {
+    struct hogp_reconnect_ctx ctx = { .attempted = 0, .connected = 0 };
+
+    bt_foreach_bond(BT_ID_DEFAULT, hogp_bond_reconnect_visitor, &ctx);
+
+    LOG_INF("Reconnect: attempted %d, initiated %d", ctx.attempted, ctx.connected);
+    return ctx.connected;
+}
+
+/*
+ * Context for selective bond clearing
+ */
+struct hogp_unpair_ctx {
+    int count;
+    bool hogp_only;  /* true = only HOGP devices, false = only host devices */
+};
+
+/*
+ * Callback for bt_foreach_bond - selectively unpair devices
  */
 static void hogp_unpair_visitor(const struct bt_bond_info *info, void *user_data) {
-    int *count = user_data;
+    struct hogp_unpair_ctx *ctx = user_data;
     char addr_str[BT_ADDR_LE_STR_LEN];
     bt_addr_le_to_str(&info->addr, addr_str, sizeof(addr_str));
 
-    LOG_INF("Found bond: %s", addr_str);
+    bool is_hogp = hogp_is_hogp_device_addr(&info->addr) ||
+                   hogp_is_remembered_addr(&info->addr);
+
+    /* Check if we should unpair this device */
+    if (ctx->hogp_only && !is_hogp) {
+        LOG_INF("Skipping host bond: %s", addr_str);
+        return;
+    }
+    if (!ctx->hogp_only && is_hogp) {
+        LOG_INF("Skipping HOGP bond: %s", addr_str);
+        return;
+    }
+
+    LOG_INF("Unpairing %s: %s", ctx->hogp_only ? "HOGP" : "host", addr_str);
 
     int err = bt_unpair(BT_ID_DEFAULT, &info->addr);
     if (err) {
         LOG_WRN("Failed to unpair %s (err %d)", addr_str, err);
     } else {
         LOG_INF("Unpaired: %s", addr_str);
-        (*count)++;
+        ctx->count++;
     }
 }
 
 /*
- * Clear HOGP bonds
+ * Clear only HOGP device bonds (not host/laptop bonds)
  */
 void hogp_clear_bonds(void) {
-    LOG_INF("=== Clearing Bonds ===");
+    LOG_INF("=== Clearing HOGP Bonds Only ===");
 
+    /* First, remember current device addresses before disconnecting */
+    for (int i = 0; i < CONFIG_ZMK_HOGP_MAX_DEVICES; i++) {
+        struct hogp_device *dev = &hogp_devices[i];
+        if (dev->state != HOGP_STATE_IDLE) {
+            hogp_remember_addr(&dev->addr);
+        }
+    }
+
+    /* Disconnect HOGP devices */
     for (int i = 0; i < CONFIG_ZMK_HOGP_MAX_DEVICES; i++) {
         struct hogp_device *dev = &hogp_devices[i];
         if (dev->conn) {
-            LOG_INF("Disconnecting slot %d...", i);
+            LOG_INF("Disconnecting HOGP slot %d...", i);
             bt_conn_disconnect(dev->conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
         }
         memset(&dev->addr, 0, sizeof(dev->addr));
@@ -861,16 +1176,112 @@ void hogp_clear_bonds(void) {
 
     k_msleep(200);
 
-    int count = 0;
-    bt_foreach_bond(BT_ID_DEFAULT, hogp_unpair_visitor, &count);
+    /* Only unpair HOGP devices */
+    struct hogp_unpair_ctx ctx = { .count = 0, .hogp_only = true };
+    bt_foreach_bond(BT_ID_DEFAULT, hogp_unpair_visitor, &ctx);
 
-    LOG_INF("Cleared %d bonds", count);
-    LOG_INF("NOTE: Split keyboard may need to reconnect");
-    LOG_INF("=== Bond Clear Complete ===");
+    /* Clear remembered addresses from RAM and NVS */
+    hogp_known_addr_count = 0;
+    memset(hogp_known_addrs, 0, sizeof(hogp_known_addrs));
+#if IS_ENABLED(CONFIG_SETTINGS)
+    for (int i = 0; i < CONFIG_ZMK_HOGP_MAX_DEVICES; i++) {
+        char setting_name[24];
+        snprintf(setting_name, sizeof(setting_name), "hogp/addr/%d", i);
+        settings_delete(setting_name);
+    }
+    settings_save_one("hogp/count", &hogp_known_addr_count, sizeof(hogp_known_addr_count));
+#endif
+
+    LOG_INF("Cleared %d HOGP bonds (host bonds preserved)", ctx.count);
+    LOG_INF("=== HOGP Bond Clear Complete ===");
 }
 
 /*
- * Initialize HOGP central
+ * Clear only host device bonds (laptops, not HOGP mice/trackpads)
+ */
+void hogp_clear_host_bonds(void) {
+    LOG_INF("=== Clearing Host Bonds Only ===");
+
+    /* Remember current HOGP addresses so we don't unpair them */
+    for (int i = 0; i < CONFIG_ZMK_HOGP_MAX_DEVICES; i++) {
+        struct hogp_device *dev = &hogp_devices[i];
+        if (dev->state != HOGP_STATE_IDLE) {
+            hogp_remember_addr(&dev->addr);
+        }
+    }
+
+    k_msleep(100);
+
+    /* Only unpair non-HOGP devices (hosts) */
+    struct hogp_unpair_ctx ctx = { .count = 0, .hogp_only = false };
+    bt_foreach_bond(BT_ID_DEFAULT, hogp_unpair_visitor, &ctx);
+
+    LOG_INF("Cleared %d host bonds (HOGP bonds preserved)", ctx.count);
+    LOG_INF("=== Host Bond Clear Complete ===");
+}
+
+/*============================================================================
+ * Settings persistence - load/save HOGP device addresses to NVS
+ *============================================================================*/
+
+#if IS_ENABLED(CONFIG_SETTINGS)
+
+static int hogp_settings_set(const char *name, size_t len, settings_read_cb read_cb, void *cb_arg) {
+    const char *next;
+
+    printk("[HOGP] settings_set: name='%s' len=%d\n", name, (int)len);
+
+    if (settings_name_steq(name, "count", &next) && !next) {
+        if (len != sizeof(hogp_known_addr_count)) {
+            return -EINVAL;
+        }
+        int err = read_cb(cb_arg, &hogp_known_addr_count, sizeof(hogp_known_addr_count));
+        if (err < 0) {
+            LOG_ERR("Failed to read HOGP addr count: %d", err);
+            return err;
+        }
+        if (hogp_known_addr_count > CONFIG_ZMK_HOGP_MAX_DEVICES) {
+            hogp_known_addr_count = CONFIG_ZMK_HOGP_MAX_DEVICES;
+        }
+        LOG_INF("Loaded HOGP device count: %d", hogp_known_addr_count);
+    } else if (settings_name_steq(name, "addr", &next) && next) {
+        int idx = atoi(next);
+        if (idx < 0 || idx >= CONFIG_ZMK_HOGP_MAX_DEVICES) {
+            return -EINVAL;
+        }
+        if (len != sizeof(bt_addr_le_t)) {
+            return -EINVAL;
+        }
+        int err = read_cb(cb_arg, &hogp_known_addrs[idx], sizeof(bt_addr_le_t));
+        if (err < 0) {
+            LOG_ERR("Failed to read HOGP addr %d: %d", idx, err);
+            return err;
+        }
+        char addr_str[BT_ADDR_LE_STR_LEN];
+        bt_addr_le_to_str(&hogp_known_addrs[idx], addr_str, sizeof(addr_str));
+        LOG_INF("Loaded HOGP device %d: %s", idx, addr_str);
+    }
+    return 0;
+}
+
+static int hogp_settings_commit(void) {
+    hogp_settings_loaded = true;
+    printk("[HOGP] settings_commit: count=%d\n", hogp_known_addr_count);
+    return 0;
+}
+
+static struct settings_handler hogp_settings_handler = {
+    .name = "hogp",
+    .h_set = hogp_settings_set,
+    .h_commit = hogp_settings_commit,
+};
+
+#endif /* CONFIG_SETTINGS */
+
+/* Settings init moved to hogp_init to ensure it runs after settings_subsys_init */
+
+/*
+ * Initialize HOGP central - BT callbacks and auto-reconnect
  */
 static int hogp_init(void) {
     LOG_INF("HOGP Central initializing...");
@@ -882,6 +1293,27 @@ static int hogp_init(void) {
     }
 
     bt_le_scan_cb_register(&hogp_scan_cb);
+    bt_conn_auth_info_cb_register(&hogp_auth_info_cb);
+
+#if IS_ENABLED(CONFIG_SETTINGS)
+    /* Register settings handler and load our subtree.
+     * We do this in hogp_init (after main() has called settings_subsys_init)
+     * rather than in early SYS_INIT to ensure settings subsystem is ready. */
+    hogp_settings_register_err = settings_register(&hogp_settings_handler);
+    LOG_INF("HOGP: settings_register returned %d", hogp_settings_register_err);
+
+    /* Load our settings subtree - this calls our h_set handler */
+    int load_err = settings_load_subtree("hogp");
+    LOG_INF("HOGP: settings_load_subtree returned %d", load_err);
+#endif
+
+    /* Debug: dump loaded settings state */
+    LOG_INF("HOGP settings state: loaded=%d, count=%d", hogp_settings_loaded, hogp_known_addr_count);
+    for (int i = 0; i < hogp_known_addr_count; i++) {
+        char addr_str[BT_ADDR_LE_STR_LEN];
+        bt_addr_le_to_str(&hogp_known_addrs[i], addr_str, sizeof(addr_str));
+        LOG_INF("  Known device %d: %s", i, addr_str);
+    }
 
 #if IS_ENABLED(CONFIG_ZMK_HOGP_AUTO_RECONNECT)
     LOG_INF("HOGP: Will scan for bonded devices in %d ms", HOGP_AUTO_RECONNECT_DELAY_MS);

@@ -44,11 +44,12 @@ LOG_MODULE_REGISTER(hogp_mouse, CONFIG_ZMK_HOGP_LOG_LEVEL);
 #define MOUSE_BTN_BACK   0x08
 #define MOUSE_BTN_FWD    0x10
 
-/* Previous button state for edge detection */
-static uint8_t prev_mouse_buttons = 0;
 
 /*
- * Process standard mouse HID report
+ * Process standard mouse HID report - direct passthrough
+ *
+ * We directly set the mouse report fields instead of using the reference-counting
+ * button APIs. This gives faithful 1:1 passthrough of the mouse state.
  */
 static void process_mouse_report(const uint8_t *data, uint16_t len) {
     if (len < MOUSE_REPORT_LEN) {
@@ -73,51 +74,13 @@ static void process_mouse_report(const uint8_t *data, uint16_t len) {
     int8_t wheel = (int8_t)data[5];
     int8_t hscroll = (int8_t)data[6];
 
-    /* Clear HID state before building new report */
-    zmk_hid_mouse_clear();
-
-    /* Handle button state changes */
-    if (buttons != prev_mouse_buttons) {
-        /* Left button */
-        if (buttons & MOUSE_BTN_LEFT) {
-            zmk_hid_mouse_button_press(0);
-        }
-        /* Right button */
-        if (buttons & MOUSE_BTN_RIGHT) {
-            zmk_hid_mouse_button_press(1);
-        }
-        /* Middle button */
-        if (buttons & MOUSE_BTN_MIDDLE) {
-            zmk_hid_mouse_button_press(2);
-        }
-        /* Back button (button 3) */
-        if (buttons & MOUSE_BTN_BACK) {
-            zmk_hid_mouse_button_press(3);
-        }
-        /* Forward button (button 4) */
-        if (buttons & MOUSE_BTN_FWD) {
-            zmk_hid_mouse_button_press(4);
-        }
-
-        prev_mouse_buttons = buttons;
-    } else {
-        /* Re-apply held buttons */
-        if (buttons & MOUSE_BTN_LEFT) zmk_hid_mouse_button_press(0);
-        if (buttons & MOUSE_BTN_RIGHT) zmk_hid_mouse_button_press(1);
-        if (buttons & MOUSE_BTN_MIDDLE) zmk_hid_mouse_button_press(2);
-        if (buttons & MOUSE_BTN_BACK) zmk_hid_mouse_button_press(3);
-        if (buttons & MOUSE_BTN_FWD) zmk_hid_mouse_button_press(4);
-    }
-
-    /* Apply movement - already relative, just forward it */
-    if (x_raw != 0 || y_raw != 0) {
-        zmk_hid_mouse_movement_set(x_raw, y_raw);
-    }
-
-    /* Apply scroll - wheel is vertical, hscroll is horizontal (wheel tilt) */
-    if (wheel != 0 || hscroll != 0) {
-        zmk_hid_mouse_scroll_set(hscroll, wheel);
-    }
+    /* Direct passthrough: get the report and set fields directly */
+    struct zmk_hid_mouse_report *report = zmk_hid_get_mouse_report();
+    report->body.buttons = buttons;  /* Direct button state - no reference counting */
+    report->body.d_x = x_raw;
+    report->body.d_y = y_raw;
+    report->body.d_scroll_y = wheel;
+    report->body.d_scroll_x = hscroll;
 
     /* Send the report */
     zmk_endpoints_send_mouse_report();
@@ -316,7 +279,6 @@ static int hogp_mouse_init(void) {
     LOG_INF("HOGP Mouse/Trackpad handler initializing...");
 
     /* Reset state */
-    prev_mouse_buttons = 0;
     memset(&primary_finger, 0, sizeof(primary_finger));
     memset(&scroll_track, 0, sizeof(scroll_track));
     trackpad_button_pressed = false;

@@ -31,12 +31,20 @@ void hogp_exit_pairing_mode(void);
 void hogp_print_status(void);
 
 /**
- * @brief Clear all HOGP bonds
+ * @brief Clear HOGP device bonds only
  *
  * Disconnects any connected HOGP devices and removes their bonds.
- * Note: This may also affect other BLE bonds.
+ * Host device bonds (laptops, etc.) are preserved.
  */
 void hogp_clear_bonds(void);
+
+/**
+ * @brief Clear host device bonds only
+ *
+ * Removes bonds for host devices (laptops, etc.).
+ * HOGP device bonds (mice, trackpads) are preserved.
+ */
+void hogp_clear_host_bonds(void);
 
 /**
  * @brief Callback type for received HID reports
@@ -55,3 +63,10 @@ typedef void (*hogp_report_callback_t)(const uint8_t *data, uint16_t len);
  * @param cb Callback function, or NULL to unregister
  */
 void hogp_register_report_callback(hogp_report_callback_t cb);
+
+/**
+ * @brief Dump NVS settings state for debugging
+ *
+ * Logs the current state of NVS-stored HOGP device addresses.
+ */
+void hogp_dump_nvs_state(void);
