@@ -30,6 +30,7 @@
 #include <zmk/battery.h>
 #include <zmk/keymap.h>
 #include <zmk/ble.h>
+#include <zmk/hogp/hogp.h>
 
 #if ZMK_BLE_IS_CENTRAL
 #include <zmk/split/bluetooth/central.h>
@@ -242,6 +243,13 @@ static const struct led_rgb LAYER_COLORS[8] = {
     LED_RGB(0x000000), LED_RGB(0xFFFFFF), LED_RGB(0x0000FF), LED_RGB(0x00FF00),
     LED_RGB(0xFF0000), LED_RGB(0xFF00FF), LED_RGB(0x00FFFF), LED_RGB(0xFFFF00)};
 
+/* HOGP indicator color - Cyan for testing visibility */
+#define HOGP_LED_COLOR LED_RGB(0x00FFFF)
+#define HOGP_LED_COLOR_DIM LED_RGB(0x003F3F)  /* Dim cyan for idle pulse */
+
+/* HOGP animation state */
+static uint16_t hogp_animation_step = 0;
+
 // Formulas chosen so that for the first 8 layers both left and right modules show the same color,
 // then as the layer number increases the right module color cycles through until "wrapping around",
 // at which point the left module colour is advanced by one as well. We skip over the off/black
@@ -297,8 +305,36 @@ static void zmk_rgb_underglow_effect_kinesis() {
 #if ZMK_BLE_IS_CENTRAL
     // leds for central (left) side
 
-    // set first led to caps lock state
-    pixels[0] = zmk_get_indicator_color(ZMK_LED_CAPSLOCK_BIT);
+    // set first led to HOGP mouse connection status (instead of caps lock)
+    hogp_animation_step++;
+    enum hogp_indicator_state hogp_state = hogp_get_indicator_state();
+    switch (hogp_state) {
+        case HOGP_INDICATOR_PAIRING:
+            // Fast blink - every 2 frames (100ms on/off)
+            pixels[0] = (hogp_animation_step % 4 < 2) ? HOGP_LED_COLOR : LED_RGB(0x000000);
+            break;
+        case HOGP_INDICATOR_SCANNING:
+            // Slow blink - every 13 frames (~650ms on/off)
+            pixels[0] = (hogp_animation_step % 26 < 13) ? HOGP_LED_COLOR : LED_RGB(0x000000);
+            break;
+        case HOGP_INDICATOR_CONNECTED:
+            // Solid orange
+            pixels[0] = HOGP_LED_COLOR;
+            break;
+        case HOGP_INDICATOR_IDLE:
+        default:
+            // Dim pulse - very slow breathing (about 5 seconds per cycle)
+            {
+                uint8_t pulse_step = (hogp_animation_step / 2) % 100;  // 0-99
+                bool dimming = (hogp_animation_step / 200) % 2;  // alternate bright/dim
+                if (dimming) {
+                    pulse_step = 99 - pulse_step;
+                }
+                // Only show dim version during part of cycle
+                pixels[0] = (pulse_step < 30) ? HOGP_LED_COLOR_DIM : LED_RGB(0x000000);
+            }
+            break;
+    }
 
     // set second led to bluetooth state, blinking quickly if bluetooth not paired,
     // and slowly if not connected

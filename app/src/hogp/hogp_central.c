@@ -78,9 +78,17 @@ static struct hogp_device hogp_devices[CONFIG_ZMK_HOGP_MAX_DEVICES];
 
 static bool hogp_pairing_mode = false;  /* Only scan/connect in pairing mode */
 static bool is_scanning = false;
+static bool hogp_reconnect_scanning = false;  /* Scanning for known devices to reconnect */
 
 /* Callback for received HID reports */
 static hogp_report_callback_t report_callback = NULL;
+
+/*
+ * Known HOGP device addresses - persisted to NVS for reconnect after reboot
+ * Declared early so reconnect logic can check count before scanning
+ */
+static bt_addr_le_t hogp_known_addrs[CONFIG_ZMK_HOGP_MAX_DEVICES];
+static int hogp_known_addr_count = 0;
 
 /* Minimum RSSI to consider connecting (-85 allows more distant devices for testing) */
 #define HOGP_MIN_RSSI_PAIRING -85
@@ -99,12 +107,18 @@ K_WORK_DELAYABLE_DEFINE(hogp_pairing_timeout_work, hogp_pairing_timeout_work_han
 static void hogp_auto_reconnect_work_handler(struct k_work *work);
 K_WORK_DELAYABLE_DEFINE(hogp_auto_reconnect_work, hogp_auto_reconnect_work_handler);
 
+/* Work to stop reconnect scan burst */
+static void hogp_reconnect_scan_stop_handler(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(hogp_reconnect_scan_stop_work, hogp_reconnect_scan_stop_handler);
+
 /* How long to wait after boot before auto-reconnect scan (ms) */
 #define HOGP_AUTO_RECONNECT_DELAY_MS 5000
 /* How long to scan for bonded devices during auto-reconnect (seconds) */
 #define HOGP_AUTO_RECONNECT_SCAN_SEC 10
-/* Periodic reconnect check interval (seconds) */
-#define HOGP_PERIODIC_RECONNECT_SEC 60
+/* Periodic reconnect check interval (seconds) - faster for mouse wake detection */
+#define HOGP_PERIODIC_RECONNECT_SEC 10
+/* How long each periodic scan burst lasts (seconds) */
+#define HOGP_RECONNECT_SCAN_BURST_SEC 3
 
 /* Forward declarations */
 static void hogp_do_subscribe(struct hogp_device *dev);
@@ -286,7 +300,7 @@ static bool hogp_ad_parse_cb(struct bt_data *data, void *user_data) {
 
 /*
  * BLE scan callback - called for each discovered device
- * Only processes devices when in pairing mode
+ * Handles both pairing mode and reconnect scanning
  */
 static void hogp_scan_recv(const struct bt_le_scan_recv_info *info,
                            struct net_buf_simple *buf) {
@@ -294,21 +308,67 @@ static void hogp_scan_recv(const struct bt_le_scan_recv_info *info,
     static int scan_count = 0;
     scan_count++;
     if (scan_count % 50 == 1) {
-        LOG_INF("HOGP scan callback active (count=%d, pairing=%d)", scan_count, hogp_pairing_mode);
+        LOG_DBG("HOGP scan (count=%d, pairing=%d, reconnect=%d)",
+                scan_count, hogp_pairing_mode, hogp_reconnect_scanning);
     }
 
-    /* Only process during pairing mode */
+    /* Check if we're already handling this device */
+    if (hogp_is_known_device(info->addr)) {
+        return;
+    }
+
+    /* Reconnect scanning mode - look for known addresses */
+    if (hogp_reconnect_scanning && !hogp_pairing_mode) {
+        if (hogp_is_remembered_addr(info->addr)) {
+            char addr_str[BT_ADDR_LE_STR_LEN];
+            bt_addr_le_to_str(info->addr, addr_str, sizeof(addr_str));
+            LOG_INF("Found known HOGP device: %s RSSI:%d - reconnecting", addr_str, info->rssi);
+
+            /* Stop reconnect scan mode and connect */
+            hogp_reconnect_scanning = false;
+            k_work_cancel_delayable(&hogp_reconnect_scan_stop_work);
+
+            /* Get a slot and connect */
+            struct hogp_device *dev = hogp_get_free_slot();
+            if (!dev) {
+                LOG_WRN("No free slots for reconnect");
+                return;
+            }
+
+            dev->state = HOGP_STATE_CONNECTING;
+            bt_addr_le_copy(&dev->addr, info->addr);
+
+            int err = bt_le_scan_stop();
+            if (err && err != -EALREADY) {
+                LOG_WRN("Scan stop returned %d", err);
+            }
+            is_scanning = false;
+
+            k_msleep(50);
+
+            err = bt_conn_le_create(info->addr, BT_CONN_LE_CREATE_CONN,
+                                    BT_LE_CONN_PARAM_DEFAULT, &dev->conn);
+            if (err) {
+                LOG_ERR("Reconnect failed (err %d)", err);
+                dev->state = HOGP_STATE_IDLE;
+                /* Schedule next reconnect attempt */
+                k_work_schedule(&hogp_auto_reconnect_work,
+                                K_SECONDS(HOGP_PERIODIC_RECONNECT_SEC));
+            } else {
+                LOG_INF("Reconnection initiated to %s", addr_str);
+            }
+        }
+        /* During reconnect scanning, only look for known devices */
+        return;
+    }
+
+    /* Only process new devices during pairing mode */
     if (!hogp_pairing_mode) {
         return;
     }
 
     /* Skip weak signals - device should be close for pairing */
     if (info->rssi < HOGP_MIN_RSSI_PAIRING) {
-        return;
-    }
-
-    /* Check if we're already handling this device */
-    if (hogp_is_known_device(info->addr)) {
         return;
     }
 
@@ -484,6 +544,55 @@ static void hogp_pairing_timeout_work_handler(struct k_work *work) {
 }
 
 /*
+ * Stop reconnect scan burst and schedule next one
+ */
+static void hogp_reconnect_scan_stop_handler(struct k_work *work) {
+    if (!hogp_reconnect_scanning) {
+        return;
+    }
+
+    LOG_DBG("Reconnect scan burst complete");
+
+    if (is_scanning) {
+        hogp_stop_scan();
+    }
+
+    hogp_reconnect_scanning = false;
+
+    /* Schedule next reconnect check */
+    k_work_schedule(&hogp_auto_reconnect_work, K_SECONDS(HOGP_PERIODIC_RECONNECT_SEC));
+}
+
+/*
+ * Start a reconnect scan burst (passive scan for known devices)
+ */
+static void hogp_start_reconnect_scan(void) {
+    if (is_scanning || hogp_pairing_mode) {
+        LOG_DBG("Cannot start reconnect scan: scanning=%d, pairing=%d",
+                is_scanning, hogp_pairing_mode);
+        return;
+    }
+
+    LOG_INF("Starting reconnect scan burst (%d sec)", HOGP_RECONNECT_SCAN_BURST_SEC);
+    hogp_reconnect_scanning = true;
+
+    /* Start passive scan - lower power, catches devices waking up */
+    int err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, NULL);
+    if (err) {
+        LOG_WRN("Reconnect scan start failed (err %d)", err);
+        hogp_reconnect_scanning = false;
+        /* Retry later */
+        k_work_schedule(&hogp_auto_reconnect_work, K_SECONDS(HOGP_PERIODIC_RECONNECT_SEC));
+        return;
+    }
+
+    is_scanning = true;
+
+    /* Schedule scan stop */
+    k_work_schedule(&hogp_reconnect_scan_stop_work, K_SECONDS(HOGP_RECONNECT_SCAN_BURST_SEC));
+}
+
+/*
  * Auto-reconnect work handler
  */
 static void hogp_auto_reconnect_work_handler(struct k_work *work) {
@@ -523,23 +632,10 @@ static void hogp_auto_reconnect_work_handler(struct k_work *work) {
     }
 
 #if IS_ENABLED(CONFIG_ZMK_HOGP_AUTO_RECONNECT)
-    if (need_reconnect) {
-        /* First try direct connection to bonded devices (faster, no scan needed) */
-        LOG_INF("Auto-reconnect: trying direct connection to bonded devices...");
-        int connected = hogp_reconnect_bonded_devices();
-
-        if (connected == 0) {
-            /* No bonded devices found, fall back to scanning */
-            LOG_INF("Auto-reconnect: no bonded devices, scanning...");
-            hogp_pairing_mode = true;
-            int err = hogp_start_scan();
-            if (err) {
-                LOG_WRN("Auto-reconnect scan failed: %d", err);
-                hogp_pairing_mode = false;
-            } else {
-                k_work_schedule(&hogp_pairing_timeout_work, K_SECONDS(HOGP_AUTO_RECONNECT_SCAN_SEC));
-            }
-        }
+    if (need_reconnect && hogp_known_addr_count > 0) {
+        /* Start passive scan burst to catch device waking up */
+        hogp_start_reconnect_scan();
+        return;  /* Don't schedule another check - scan stop handler will do it */
     }
 #endif
 
@@ -908,14 +1004,7 @@ static const char *hogp_state_name(enum hogp_device_state state) {
     }
 }
 
-/*
- * Stored addresses of HOGP devices we've seen (for clearing bonds)
- * We track these because RPA addresses change, but we store the bonded identity
- * Persisted to NVS so reconnection works after keyboard reboot.
- * NOTE: Declared here (before hogp_print_status) so hogp_dump_nvs_state can use them.
- */
-static bt_addr_le_t hogp_known_addrs[CONFIG_ZMK_HOGP_MAX_DEVICES];
-static int hogp_known_addr_count = 0;
+/* hogp_known_addrs and hogp_known_addr_count declared earlier in file */
 static int hogp_settings_register_err = -999;  /* Track registration result */
 #if IS_ENABLED(CONFIG_SETTINGS)
 static bool hogp_settings_loaded = false;
@@ -928,6 +1017,8 @@ void hogp_print_status(void) {
     LOG_INF("=== HOGP Status ===");
     LOG_INF("Pairing mode: %s", hogp_pairing_mode ? "ON" : "OFF");
     LOG_INF("Scanning: %s", is_scanning ? "YES" : "NO");
+    LOG_INF("Reconnect scan: %s", hogp_reconnect_scanning ? "YES" : "NO");
+    LOG_INF("Known devices: %d", hogp_known_addr_count);
 
     for (int i = 0; i < CONFIG_ZMK_HOGP_MAX_DEVICES; i++) {
         struct hogp_device *dev = &hogp_devices[i];
@@ -961,6 +1052,36 @@ void hogp_dump_nvs_state(void) {
         LOG_INF("  addr[%d]: %s", i, addr_str);
     }
     LOG_INF("======================");
+}
+
+/*
+ * Get current HOGP indicator state for LED display
+ */
+enum hogp_indicator_state hogp_get_indicator_state(void) {
+    /* Check if any device is connected/ready */
+    for (int i = 0; i < CONFIG_ZMK_HOGP_MAX_DEVICES; i++) {
+        if (hogp_devices[i].state == HOGP_STATE_READY) {
+            return HOGP_INDICATOR_CONNECTED;
+        }
+    }
+
+    /* Check if in pairing mode (user-initiated scan) */
+    if (hogp_pairing_mode) {
+        return HOGP_INDICATOR_PAIRING;
+    }
+
+    /* Check if reconnect scanning for known devices */
+    if (hogp_reconnect_scanning) {
+        return HOGP_INDICATOR_SCANNING;
+    }
+
+    /* If we have known devices but not connected, we're effectively scanning */
+    if (hogp_known_addr_count > 0) {
+        return HOGP_INDICATOR_SCANNING;
+    }
+
+    /* No known devices - idle state */
+    return HOGP_INDICATOR_IDLE;
 }
 
 /*

@@ -70,3 +70,20 @@ void hogp_register_report_callback(hogp_report_callback_t cb);
  * Logs the current state of NVS-stored HOGP device addresses.
  */
 void hogp_dump_nvs_state(void);
+
+/**
+ * @brief HOGP indicator states for LED display
+ */
+enum hogp_indicator_state {
+    HOGP_INDICATOR_IDLE,       /* No known devices - dim pulse */
+    HOGP_INDICATOR_PAIRING,    /* Pairing mode - fast blink */
+    HOGP_INDICATOR_SCANNING,   /* Reconnect scanning - slow blink */
+    HOGP_INDICATOR_CONNECTED,  /* Connected and ready - solid */
+};
+
+/**
+ * @brief Get current HOGP indicator state for LED display
+ *
+ * @return Current indicator state
+ */
+enum hogp_indicator_state hogp_get_indicator_state(void);
