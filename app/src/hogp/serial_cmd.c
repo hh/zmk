@@ -121,6 +121,10 @@ static void process_command(const char *cmd) {
         LOG_INF("Stopping HOGP pairing mode...");
         hogp_exit_pairing_mode();
 
+    } else if (strncmp(cmd, "scan", 4) == 0) {
+        LOG_INF("Starting reconnect scan for known devices...");
+        hogp_start_reconnect_scan();
+
     } else if (strncmp(cmd, "hogp", 4) == 0 || strncmp(cmd, "status", 6) == 0) {
         hogp_print_status();
 
@@ -131,6 +135,12 @@ static void process_command(const char *cmd) {
     } else if (strncmp(cmd, "clear", 5) == 0) {
         LOG_INF("Clearing HOGP bonds only (hosts preserved)...");
         hogp_clear_bonds();
+
+    } else if (strncmp(cmd, "nvsclear", 8) == 0) {
+        /* Clear NVS only - no BLE operations, won't block */
+        LOG_INF("Clearing HOGP NVS settings only (no disconnect)...");
+        hogp_clear_nvs_only();
+        LOG_INF("NVS cleared. Reboot to take effect.");
 
     } else if (strncmp(cmd, "nvs", 3) == 0) {
         hogp_dump_nvs_state();

@@ -29,6 +29,8 @@
 #include <zephyr/settings/settings.h>
 
 #include <zmk/hogp/hogp.h>
+#include <zmk/hid.h>
+#include <zmk/endpoints.h>
 
 LOG_MODULE_REGISTER(hogp, CONFIG_ZMK_HOGP_LOG_LEVEL);
 
@@ -319,9 +321,17 @@ static void hogp_scan_recv(const struct bt_le_scan_recv_info *info,
 
     /* Reconnect scanning mode - look for known addresses */
     if (hogp_reconnect_scanning && !hogp_pairing_mode) {
-        if (hogp_is_remembered_addr(info->addr)) {
+        /* Resolve RPA to identity address using stored IRK (if available) */
+        const bt_addr_le_t *id_addr = bt_lookup_id_addr(BT_ID_DEFAULT, info->addr);
+
+        if (hogp_is_remembered_addr(id_addr)) {
             char addr_str[BT_ADDR_LE_STR_LEN];
+            char id_str[BT_ADDR_LE_STR_LEN];
             bt_addr_le_to_str(info->addr, addr_str, sizeof(addr_str));
+            bt_addr_le_to_str(id_addr, id_str, sizeof(id_str));
+            if (bt_addr_le_cmp(info->addr, id_addr) != 0) {
+                LOG_INF("Resolved RPA %s -> identity %s", addr_str, id_str);
+            }
             LOG_INF("Found known HOGP device: %s RSSI:%d - reconnecting", addr_str, info->rssi);
 
             /* Stop reconnect scan mode and connect */
@@ -566,7 +576,7 @@ static void hogp_reconnect_scan_stop_handler(struct k_work *work) {
 /*
  * Start a reconnect scan burst (passive scan for known devices)
  */
-static void hogp_start_reconnect_scan(void) {
+void hogp_start_reconnect_scan(void) {
     if (is_scanning || hogp_pairing_mode) {
         LOG_DBG("Cannot start reconnect scan: scanning=%d, pairing=%d",
                 is_scanning, hogp_pairing_mode);
@@ -876,6 +886,11 @@ static void hogp_disconnected(struct bt_conn *conn, uint8_t reason) {
     dev->state = HOGP_STATE_IDLE;
     dev->report_handle = 0;
 
+    /* Clear mouse state to release any stuck buttons */
+    zmk_hid_mouse_clear();
+    zmk_endpoints_send_mouse_report();
+    LOG_INF("HOGP: Cleared mouse state on disconnect");
+
     LOG_INF("HOGP: Will attempt reconnect in 3 seconds...");
     k_work_schedule(&hogp_auto_reconnect_work, K_SECONDS(3));
 }
@@ -950,10 +965,22 @@ static void hogp_pairing_complete(struct bt_conn *conn, bool bonded) {
     bt_addr_le_to_str(&dev->addr, addr_str, sizeof(addr_str));
     LOG_INF("Pairing complete for %s (bonded=%d)", addr_str, bonded);
 
-    /* Remember this address for auto-reconnect */
+    /* Remember the IDENTITY address for auto-reconnect (not RPA) */
     if (bonded) {
-        hogp_remember_addr(&dev->addr);
-        LOG_INF("Remembered HOGP device for auto-reconnect: %s", addr_str);
+        /* After pairing, bt_conn_get_dst returns the identity address if IRK was exchanged */
+        const bt_addr_le_t *conn_addr = bt_conn_get_dst(conn);
+        /* Also try to resolve via IRK lookup in case conn_addr is still RPA */
+        const bt_addr_le_t *id_addr = bt_lookup_id_addr(BT_ID_DEFAULT, conn_addr);
+
+        char id_str[BT_ADDR_LE_STR_LEN];
+        bt_addr_le_to_str(id_addr, id_str, sizeof(id_str));
+
+        if (bt_addr_le_cmp(conn_addr, id_addr) != 0) {
+            LOG_INF("Device has identity address: %s (was %s)", id_str, addr_str);
+        }
+
+        hogp_remember_addr(id_addr);
+        LOG_INF("Remembered HOGP device for auto-reconnect: %s", id_str);
     }
 
     if (dev->state == HOGP_STATE_CONNECTED) {
@@ -1058,9 +1085,10 @@ void hogp_dump_nvs_state(void) {
  * Get current HOGP indicator state for LED display
  */
 enum hogp_indicator_state hogp_get_indicator_state(void) {
-    /* Check if any device is connected/ready */
+    /* Check if any device is connected (any state >= CONNECTED means we have an active connection) */
     for (int i = 0; i < CONFIG_ZMK_HOGP_MAX_DEVICES; i++) {
-        if (hogp_devices[i].state == HOGP_STATE_READY) {
+        if (hogp_devices[i].state >= HOGP_STATE_CONNECTED) {
+            /* CONNECTED, DISCOVERING, SUBSCRIBING, or READY - all mean we're connected */
             return HOGP_INDICATOR_CONNECTED;
         }
     }
@@ -1075,7 +1103,14 @@ enum hogp_indicator_state hogp_get_indicator_state(void) {
         return HOGP_INDICATOR_SCANNING;
     }
 
-    /* If we have known devices but not connected, we're effectively scanning */
+    /* Check if actively trying to connect */
+    for (int i = 0; i < CONFIG_ZMK_HOGP_MAX_DEVICES; i++) {
+        if (hogp_devices[i].state == HOGP_STATE_CONNECTING) {
+            return HOGP_INDICATOR_SCANNING;
+        }
+    }
+
+    /* If we have known devices but not connected, we're waiting to reconnect */
     if (hogp_known_addr_count > 0) {
         return HOGP_INDICATOR_SCANNING;
     }
@@ -1122,24 +1157,54 @@ static void hogp_save_known_addrs(void) {
 }
 
 /*
+ * Check if an address is currently connected
+ */
+static bool hogp_is_addr_connected(const bt_addr_le_t *addr) {
+    for (int i = 0; i < CONFIG_ZMK_HOGP_MAX_DEVICES; i++) {
+        if (hogp_devices[i].state != HOGP_STATE_IDLE) {
+            if (bt_addr_le_cmp(&hogp_devices[i].addr, addr) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/*
  * Remember an address as belonging to an HOGP device
  */
 static void hogp_remember_addr(const bt_addr_le_t *addr) {
+    char addr_str[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
+
     /* Check if already known */
     for (int i = 0; i < hogp_known_addr_count; i++) {
         if (bt_addr_le_cmp(&hogp_known_addrs[i], addr) == 0) {
             return;  /* Already tracked */
         }
     }
+
     /* Add if space available */
     if (hogp_known_addr_count < CONFIG_ZMK_HOGP_MAX_DEVICES) {
         bt_addr_le_copy(&hogp_known_addrs[hogp_known_addr_count++], addr);
-        char addr_str[BT_ADDR_LE_STR_LEN];
-        bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
         LOG_INF("Remembering HOGP device: %s", addr_str);
-        /* Persist to NVS */
         hogp_save_known_addrs();
+        return;
     }
+
+    /* No space - try to replace a stale (disconnected) address */
+    for (int i = 0; i < hogp_known_addr_count; i++) {
+        if (!hogp_is_addr_connected(&hogp_known_addrs[i])) {
+            char old_str[BT_ADDR_LE_STR_LEN];
+            bt_addr_le_to_str(&hogp_known_addrs[i], old_str, sizeof(old_str));
+            LOG_INF("Replacing stale address %s with %s", old_str, addr_str);
+            bt_addr_le_copy(&hogp_known_addrs[i], addr);
+            hogp_save_known_addrs();
+            return;
+        }
+    }
+
+    LOG_WRN("Cannot remember %s - all slots in use by connected devices", addr_str);
 }
 
 /*
@@ -1318,6 +1383,30 @@ void hogp_clear_bonds(void) {
 }
 
 /*
+ * Clear only NVS settings - no BLE operations, safe from serial thread
+ */
+void hogp_clear_nvs_only(void) {
+    LOG_INF("=== Clearing HOGP NVS Only ===");
+
+    /* Clear RAM state */
+    hogp_known_addr_count = 0;
+    memset(hogp_known_addrs, 0, sizeof(hogp_known_addrs));
+
+#if IS_ENABLED(CONFIG_SETTINGS)
+    /* Clear NVS */
+    for (int i = 0; i < CONFIG_ZMK_HOGP_MAX_DEVICES; i++) {
+        char setting_name[24];
+        snprintf(setting_name, sizeof(setting_name), "hogp/addr/%d", i);
+        settings_delete(setting_name);
+    }
+    settings_save_one("hogp/count", &hogp_known_addr_count, sizeof(hogp_known_addr_count));
+#endif
+
+    LOG_INF("NVS cleared. known_addr_count=%d", hogp_known_addr_count);
+    LOG_INF("=== HOGP NVS Clear Complete ===");
+}
+
+/*
  * Clear only host device bonds (laptops, not HOGP mice/trackpads)
  */
 void hogp_clear_host_bonds(void) {
@@ -1347,24 +1436,28 @@ void hogp_clear_host_bonds(void) {
 
 #if IS_ENABLED(CONFIG_SETTINGS)
 
+/* Track which address slots were actually loaded from NVS */
+static bool hogp_addr_loaded[CONFIG_ZMK_HOGP_MAX_DEVICES];
+
 static int hogp_settings_set(const char *name, size_t len, settings_read_cb read_cb, void *cb_arg) {
     const char *next;
 
     printk("[HOGP] settings_set: name='%s' len=%d\n", name, (int)len);
 
     if (settings_name_steq(name, "count", &next) && !next) {
-        if (len != sizeof(hogp_known_addr_count)) {
+        /* We ignore the saved count - will recalculate in commit based on
+         * actually loaded addresses. This fixes the bug where count=2 but
+         * only 1 address was actually saved/loaded. */
+        int saved_count;
+        if (len != sizeof(saved_count)) {
             return -EINVAL;
         }
-        int err = read_cb(cb_arg, &hogp_known_addr_count, sizeof(hogp_known_addr_count));
+        int err = read_cb(cb_arg, &saved_count, sizeof(saved_count));
         if (err < 0) {
             LOG_ERR("Failed to read HOGP addr count: %d", err);
             return err;
         }
-        if (hogp_known_addr_count > CONFIG_ZMK_HOGP_MAX_DEVICES) {
-            hogp_known_addr_count = CONFIG_ZMK_HOGP_MAX_DEVICES;
-        }
-        LOG_INF("Loaded HOGP device count: %d", hogp_known_addr_count);
+        LOG_INF("NVS says HOGP device count: %d (will verify)", saved_count);
     } else if (settings_name_steq(name, "addr", &next) && next) {
         int idx = atoi(next);
         if (idx < 0 || idx >= CONFIG_ZMK_HOGP_MAX_DEVICES) {
@@ -1378,6 +1471,7 @@ static int hogp_settings_set(const char *name, size_t len, settings_read_cb read
             LOG_ERR("Failed to read HOGP addr %d: %d", idx, err);
             return err;
         }
+        hogp_addr_loaded[idx] = true;  /* Mark this slot as loaded */
         char addr_str[BT_ADDR_LE_STR_LEN];
         bt_addr_le_to_str(&hogp_known_addrs[idx], addr_str, sizeof(addr_str));
         LOG_INF("Loaded HOGP device %d: %s", idx, addr_str);
@@ -1387,7 +1481,23 @@ static int hogp_settings_set(const char *name, size_t len, settings_read_cb read
 
 static int hogp_settings_commit(void) {
     hogp_settings_loaded = true;
-    printk("[HOGP] settings_commit: count=%d\n", hogp_known_addr_count);
+
+    /* Compact loaded addresses and recalculate count.
+     * This ensures hogp_known_addr_count matches reality. */
+    int actual_count = 0;
+    for (int i = 0; i < CONFIG_ZMK_HOGP_MAX_DEVICES; i++) {
+        if (hogp_addr_loaded[i]) {
+            if (actual_count != i) {
+                /* Move to fill gap */
+                bt_addr_le_copy(&hogp_known_addrs[actual_count], &hogp_known_addrs[i]);
+                memset(&hogp_known_addrs[i], 0, sizeof(bt_addr_le_t));
+            }
+            actual_count++;
+        }
+    }
+    hogp_known_addr_count = actual_count;
+
+    printk("[HOGP] settings_commit: verified count=%d\n", hogp_known_addr_count);
     return 0;
 }
 

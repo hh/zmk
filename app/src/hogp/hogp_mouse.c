@@ -16,7 +16,9 @@
 
 #include <zmk/hogp/hogp.h>
 #include <zmk/hid.h>
+#include <zmk/hog.h>
 #include <zmk/endpoints.h>
+#include <string.h>
 
 LOG_MODULE_REGISTER(hogp_mouse, CONFIG_ZMK_HOGP_LOG_LEVEL);
 
