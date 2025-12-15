@@ -17,6 +17,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/behavior.h>
 
 #include <zmk/ble.h>
+#include <zmk/endpoints.h>
 
 #if DT_HAS_COMPAT_STATUS_OKAY(DT_DRV_COMPAT)
 
@@ -95,10 +96,13 @@ static int on_keymap_binding_pressed(struct zmk_behavior_binding *binding,
         zmk_ble_clear_bonds();
         return 0;
     case BT_NXT_CMD:
+        zmk_endpoints_select_transport(ZMK_TRANSPORT_BLE);
         return zmk_ble_prof_next();
     case BT_PRV_CMD:
+        zmk_endpoints_select_transport(ZMK_TRANSPORT_BLE);
         return zmk_ble_prof_prev();
     case BT_SEL_CMD:
+        zmk_endpoints_select_transport(ZMK_TRANSPORT_BLE);
         return zmk_ble_prof_select(binding->param2);
     case BT_CLR_ALL_CMD:
         zmk_ble_clear_all_bonds();

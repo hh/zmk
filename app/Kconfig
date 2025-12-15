@@ -135,6 +135,15 @@ config ZMK_USB_BOOT
     select USB_HID_BOOT_PROTOCOL
     select USB_DEVICE_SOF
 
+config ZMK_USB_HID_TRACKPAD_INTERFACE
+    bool "Separate USB HID interface for trackpad"
+    depends on ZMK_USB
+    help
+      When enabled, the trackpad is placed on a separate USB HID interface (HID_1)
+      from the keyboard/mouse (HID_0). This allows Linux hid-multitouch to bind
+      to the trackpad interface while hid-generic handles the keyboard/mouse.
+      Requires CONFIG_USB_HID_DEVICE_COUNT=2.
+
 if ZMK_USB
 
 config USB_NUMOF_EP_WRITE_RETRIES

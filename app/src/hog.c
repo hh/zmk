@@ -18,6 +18,9 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/endpoints_types.h>
 #include <zmk/hog.h>
 #include <zmk/hid.h>
+#if IS_ENABLED(CONFIG_ZMK_HOGP)
+#include <zmk/hogp/hogp.h>
+#endif
 #if IS_ENABLED(CONFIG_ZMK_POINTING_SMOOTH_SCROLLING)
 #include <zmk/pointing/resolution_multipliers.h>
 #endif // IS_ENABLED(CONFIG_ZMK_POINTING_SMOOTH_SCROLLING)
@@ -90,14 +93,14 @@ static struct hids_report mouse_feature = {
 
 #endif // IS_ENABLED(CONFIG_ZMK_POINTING)
 
-#if IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT)
+#if IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT) || IS_ENABLED(CONFIG_ZMK_HOGP_ITRACK_OUTPUT)
 
 static struct hids_report trackpad_input = {
     .id = ZMK_HID_REPORT_ID_TRACKPAD,
     .type = HIDS_INPUT,
 };
 
-#endif // IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT)
+#endif // IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT) || IS_ENABLED(CONFIG_ZMK_HOGP_ITRACK_OUTPUT)
 
 static bool host_requests_notification = false;
 static uint8_t ctrl_point;
@@ -212,7 +215,7 @@ static ssize_t write_hids_mouse_feature_report(struct bt_conn *conn,
 
 #endif // IS_ENABLED(CONFIG_ZMK_POINTING)
 
-#if IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT)
+#if IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT) || IS_ENABLED(CONFIG_ZMK_HOGP_ITRACK_OUTPUT)
 
 static ssize_t read_hids_trackpad_input_report(struct bt_conn *conn, const struct bt_gatt_attr *attr,
                                                void *buf, uint16_t len, uint16_t offset) {
@@ -221,7 +224,7 @@ static ssize_t read_hids_trackpad_input_report(struct bt_conn *conn, const struc
                              sizeof(struct zmk_hid_trackpad_report_body));
 }
 
-#endif // IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT)
+#endif // IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT) || IS_ENABLED(CONFIG_ZMK_HOGP_ITRACK_OUTPUT)
 
 // static ssize_t write_proto_mode(struct bt_conn *conn,
 //                                 const struct bt_gatt_attr *attr,
@@ -289,13 +292,13 @@ BT_GATT_SERVICE_DEFINE(
 
 #endif // IS_ENABLED(CONFIG_ZMK_POINTING)
 
-#if IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT)
+#if IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT) || IS_ENABLED(CONFIG_ZMK_HOGP_ITRACK_OUTPUT)
     BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_REPORT, BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
                            BT_GATT_PERM_READ_ENCRYPT, read_hids_trackpad_input_report, NULL, NULL),
     BT_GATT_CCC(input_ccc_changed, BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
     BT_GATT_DESCRIPTOR(BT_UUID_HIDS_REPORT_REF, BT_GATT_PERM_READ_ENCRYPT, read_hids_report_ref,
                        NULL, &trackpad_input),
-#endif // IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT)
+#endif // IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT) || IS_ENABLED(CONFIG_ZMK_HOGP_ITRACK_OUTPUT)
 
 #if IS_ENABLED(CONFIG_ZMK_HID_INDICATORS)
     BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_REPORT,
@@ -430,6 +433,14 @@ void send_mouse_report_callback(struct k_work *work) {
             return;
         }
 
+        /* Debug: log the actual values being sent over BLE */
+        if (zmk_debug_enabled && (report.buttons || report.d_x || report.d_y ||
+                                   report.d_scroll_y || report.d_scroll_x)) {
+            LOG_INF("BLE mouse: btn=0x%02x x=%d y=%d scroll_y=%d scroll_x=%d",
+                    report.buttons, report.d_x, report.d_y,
+                    report.d_scroll_y, report.d_scroll_x);
+        }
+
         struct bt_gatt_notify_params notify_params = {
             .attr = &hog_svc.attrs[13],
             .data = &report,
@@ -450,6 +461,14 @@ void send_mouse_report_callback(struct k_work *work) {
 K_WORK_DEFINE(hog_mouse_work, send_mouse_report_callback);
 
 int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
+    /* Debug: log report being queued for BLE */
+    if (zmk_debug_enabled && (report->buttons || report->d_x || report->d_y ||
+                               report->d_scroll_y || report->d_scroll_x)) {
+        LOG_INF("Queue BLE mouse: btn=0x%02x x=%d y=%d scroll_y=%d scroll_x=%d",
+                report->buttons, report->d_x, report->d_y,
+                report->d_scroll_y, report->d_scroll_x);
+    }
+
     int err = k_msgq_put(&zmk_hog_mouse_msgq, report, K_MSEC(100));
     if (err) {
         switch (err) {
@@ -471,7 +490,7 @@ int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *report) {
 };
 #endif // IS_ENABLED(CONFIG_ZMK_POINTING)
 
-#if IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT)
+#if IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT) || IS_ENABLED(CONFIG_ZMK_HOGP_ITRACK_OUTPUT)
 
 #ifndef CONFIG_ZMK_BLE_TRACKPAD_REPORT_QUEUE_SIZE
 #define CONFIG_ZMK_BLE_TRACKPAD_REPORT_QUEUE_SIZE 20
@@ -485,6 +504,9 @@ void send_trackpad_report_callback(struct k_work *work) {
     while (k_msgq_get(&zmk_hog_trackpad_msgq, &report, K_NO_WAIT) == 0) {
         struct bt_conn *conn = zmk_ble_active_profile_conn();
         if (conn == NULL) {
+            if (zmk_debug_enabled) {
+                LOG_WRN("Trackpad HOG: no active BLE connection");
+            }
             return;
         }
 
@@ -513,11 +535,21 @@ void send_trackpad_report_callback(struct k_work *work) {
             .len = sizeof(report),
         };
 
+        if (zmk_debug_enabled) {
+            LOG_DBG("Trackpad HOG: sending %d bytes to attr[%d]", sizeof(report), trackpad_attr_idx);
+        }
         int err = bt_gatt_notify_cb(conn, &notify_params);
         if (err == -EPERM) {
+            if (zmk_debug_enabled) {
+                LOG_WRN("Trackpad HOG: EPERM, setting security");
+            }
             bt_conn_set_security(conn, BT_SECURITY_L2);
         } else if (err) {
-            LOG_DBG("Error notifying trackpad %d", err);
+            if (zmk_debug_enabled) {
+                LOG_WRN("Trackpad HOG: notify error %d", err);
+            }
+        } else if (zmk_debug_enabled) {
+            LOG_DBG("Trackpad HOG: sent OK");
         }
 
         bt_conn_unref(conn);
@@ -527,6 +559,9 @@ void send_trackpad_report_callback(struct k_work *work) {
 K_WORK_DEFINE(hog_trackpad_work, send_trackpad_report_callback);
 
 int zmk_hog_send_trackpad_report(struct zmk_hid_trackpad_report_body *report) {
+    if (zmk_debug_enabled) {
+        LOG_DBG("zmk_hog_send_trackpad_report called");
+    }
     int err = k_msgq_put(&zmk_hog_trackpad_msgq, report, K_MSEC(100));
     if (err) {
         switch (err) {
@@ -546,7 +581,7 @@ int zmk_hog_send_trackpad_report(struct zmk_hid_trackpad_report_body *report) {
 
     return 0;
 };
-#endif // IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT)
+#endif // IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT) || IS_ENABLED(CONFIG_ZMK_HOGP_ITRACK_OUTPUT)
 
 static int zmk_hog_init(void) {
     static const struct k_work_queue_config queue_config = {.name = "HID Over GATT Send Work"};

@@ -33,6 +33,14 @@ static struct zmk_hid_mouse_report mouse_report = {
 
 #endif // IS_ENABLED(CONFIG_ZMK_POINTING)
 
+#if IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT) || IS_ENABLED(CONFIG_ZMK_HOGP_ITRACK_OUTPUT)
+
+static struct zmk_hid_trackpad_report trackpad_report = {
+    .report_id = ZMK_HID_REPORT_ID_TRACKPAD,
+    .body = {.scan_time = 0, .buttons = 0, .fingers = {{0}}}};
+
+#endif // IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT) || IS_ENABLED(CONFIG_ZMK_HOGP_ITRACK_OUTPUT)
+
 // Keep track of how often a modifier was pressed.
 // Only release the modifier if the count is 0.
 static int explicit_modifier_counts[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -477,3 +485,13 @@ struct zmk_hid_consumer_report *zmk_hid_get_consumer_report(void) { return &cons
 struct zmk_hid_mouse_report *zmk_hid_get_mouse_report(void) { return &mouse_report; }
 
 #endif // IS_ENABLED(CONFIG_ZMK_POINTING)
+
+#if IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT) || IS_ENABLED(CONFIG_ZMK_HOGP_ITRACK_OUTPUT)
+
+struct zmk_hid_trackpad_report *zmk_hid_get_trackpad_report(void) { return &trackpad_report; }
+
+void zmk_hid_trackpad_clear(void) {
+    memset(&trackpad_report.body, 0, sizeof(trackpad_report.body));
+}
+
+#endif // IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT) || IS_ENABLED(CONFIG_ZMK_HOGP_ITRACK_OUTPUT)

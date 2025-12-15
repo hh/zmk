@@ -68,10 +68,20 @@ int zmk_endpoints_toggle_transport(void);
  */
 struct zmk_endpoint_instance zmk_endpoints_selected(void);
 
+/**
+ * Gets the user's preferred transport (USB or BLE), independent of
+ * what's actually being used after fallback logic.
+ */
+enum zmk_transport zmk_endpoints_preferred_transport(void);
+
 int zmk_endpoints_send_report(uint16_t usage_page);
 
 #if IS_ENABLED(CONFIG_ZMK_POINTING)
 int zmk_endpoints_send_mouse_report();
 #endif // IS_ENABLED(CONFIG_ZMK_POINTING)
+
+#if IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT) || IS_ENABLED(CONFIG_ZMK_HOGP_ITRACK_OUTPUT)
+int zmk_endpoints_send_trackpad_report();
+#endif
 
 void zmk_endpoints_clear_current(void);

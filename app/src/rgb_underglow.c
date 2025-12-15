@@ -30,6 +30,7 @@
 #include <zmk/battery.h>
 #include <zmk/keymap.h>
 #include <zmk/ble.h>
+#include <zmk/endpoints.h>
 #include <zmk/hogp/hogp.h>
 
 #if ZMK_BLE_IS_CENTRAL
@@ -233,19 +234,26 @@ static void zmk_rgb_underglow_central_send() {
     }
 }
 
-#define NUM_BT_COLORS 4
+#define NUM_BT_COLORS 5
 
 static const struct led_rgb BT_COLORS[NUM_BT_COLORS] = {LED_RGB(0xFFFFFF), LED_RGB(0x0000FF),
-                                                        LED_RGB(0xFF0000), LED_RGB(0x00FF00)};
+                                                        LED_RGB(0xFF0000), LED_RGB(0x00FF00),
+                                                        LED_RGB(0xFFFF00)};  /* Yellow for BT4 */
+
+/* USB indicator: cyan (distinct from all BT profile colors) */
+#define USB_INDICATOR_COLOR LED_RGB(0x00FFFF)
 #endif
 
 static const struct led_rgb LAYER_COLORS[8] = {
     LED_RGB(0x000000), LED_RGB(0xFFFFFF), LED_RGB(0x0000FF), LED_RGB(0x00FF00),
     LED_RGB(0xFF0000), LED_RGB(0xFF00FF), LED_RGB(0x00FFFF), LED_RGB(0xFFFF00)};
 
-/* HOGP indicator color - Cyan for testing visibility */
-#define HOGP_LED_COLOR LED_RGB(0x00FFFF)
-#define HOGP_LED_COLOR_DIM LED_RGB(0x003F3F)  /* Dim cyan for idle pulse */
+/* HOGP indicator colors - different for mouse vs iTrack */
+#define HOGP_MOUSE_COLOR LED_RGB(0x00FFFF)      /* Cyan for mouse */
+#define HOGP_MOUSE_COLOR_DIM LED_RGB(0x003F3F)  /* Dim cyan */
+#define HOGP_ITRACK_COLOR LED_RGB(0xFF00FF)     /* Magenta for iTrack */
+#define HOGP_ITRACK_COLOR_DIM LED_RGB(0x3F003F) /* Dim magenta */
+#define HOGP_BOTH_COLOR LED_RGB(0x00FF00)       /* Green when both connected */
 
 /* HOGP animation state */
 static uint16_t hogp_animation_step = 0;
@@ -305,46 +313,57 @@ static void zmk_rgb_underglow_effect_kinesis() {
 #if ZMK_BLE_IS_CENTRAL
     // leds for central (left) side
 
-    // set first led to HOGP mouse connection status (instead of caps lock)
+    // HOGP per-device indicators: pixel[0] shows mouse + iTrack status
     hogp_animation_step++;
-    enum hogp_indicator_state hogp_state = hogp_get_indicator_state();
-    switch (hogp_state) {
-        case HOGP_INDICATOR_PAIRING:
-            // Fast blink - every 2 frames (100ms on/off)
-            pixels[0] = (hogp_animation_step % 4 < 2) ? HOGP_LED_COLOR : LED_RGB(0x000000);
-            break;
-        case HOGP_INDICATOR_SCANNING:
-            // Slow blink - every 13 frames (~650ms on/off)
-            pixels[0] = (hogp_animation_step % 26 < 13) ? HOGP_LED_COLOR : LED_RGB(0x000000);
-            break;
-        case HOGP_INDICATOR_CONNECTED:
-            // Solid orange
-            pixels[0] = HOGP_LED_COLOR;
-            break;
-        case HOGP_INDICATOR_IDLE:
-        default:
-            // Dim pulse - very slow breathing (about 5 seconds per cycle)
-            {
-                uint8_t pulse_step = (hogp_animation_step / 2) % 100;  // 0-99
-                bool dimming = (hogp_animation_step / 200) % 2;  // alternate bright/dim
-                if (dimming) {
-                    pulse_step = 99 - pulse_step;
-                }
-                // Only show dim version during part of cycle
-                pixels[0] = (pulse_step < 30) ? HOGP_LED_COLOR_DIM : LED_RGB(0x000000);
-            }
-            break;
+    enum hogp_indicator_state mouse_state = hogp_get_device_indicator_state(HOGP_DEVICE_MOUSE);
+    enum hogp_indicator_state itrack_state = hogp_get_device_indicator_state(HOGP_DEVICE_ITRACK);
+
+    // Determine LED color based on both device states
+    bool mouse_connected = (mouse_state == HOGP_INDICATOR_CONNECTED);
+    bool itrack_connected = (itrack_state == HOGP_INDICATOR_CONNECTED);
+    bool is_pairing = (mouse_state == HOGP_INDICATOR_PAIRING || itrack_state == HOGP_INDICATOR_PAIRING);
+    bool is_scanning = (mouse_state == HOGP_INDICATOR_SCANNING || itrack_state == HOGP_INDICATOR_SCANNING);
+
+    if (mouse_connected && itrack_connected) {
+        // Both connected - solid green
+        pixels[0] = HOGP_BOTH_COLOR;
+    } else if (mouse_connected) {
+        // Only mouse connected - solid cyan
+        pixels[0] = HOGP_MOUSE_COLOR;
+    } else if (itrack_connected) {
+        // Only iTrack connected - solid magenta
+        pixels[0] = HOGP_ITRACK_COLOR;
+    } else if (is_pairing) {
+        // Pairing mode - fast blink (white)
+        pixels[0] = (hogp_animation_step % 4 < 2) ? LED_RGB(0xFFFFFF) : LED_RGB(0x000000);
+    } else if (is_scanning) {
+        // Scanning - slow blink (white)
+        pixels[0] = (hogp_animation_step % 26 < 13) ? LED_RGB(0x808080) : LED_RGB(0x000000);
+    } else {
+        // Idle - dim pulse
+        uint8_t pulse_step = (hogp_animation_step / 2) % 100;
+        bool dimming = (hogp_animation_step / 200) % 2;
+        if (dimming) {
+            pulse_step = 99 - pulse_step;
+        }
+        pixels[0] = (pulse_step < 30) ? HOGP_MOUSE_COLOR_DIM : LED_RGB(0x000000);
     }
 
-    // set second led to bluetooth state, blinking quickly if bluetooth not paired,
-    // and slowly if not connected
-    int bt_idx = zmk_ble_active_profile_index();
-    if (zmk_ble_active_profile_is_open()) {
-        bt_blinking = zmk_kinesis_blink_step(0, 2);
-    } else if (!zmk_ble_active_profile_is_connected()) {
-        bt_blinking = zmk_kinesis_blink_step(1, 13);
+    // set second led to output mode indicator
+    // USB: solid cyan, BT: profile color (blinking if not paired/connected)
+    // Show what transport is ACTUALLY being used for output
+    struct zmk_endpoint_instance endpoint = zmk_endpoints_selected();
+    if (endpoint.transport == ZMK_TRANSPORT_USB) {
+        pixels[1] = USB_INDICATOR_COLOR;
+    } else {
+        int bt_idx = zmk_ble_active_profile_index();
+        if (zmk_ble_active_profile_is_open()) {
+            bt_blinking = zmk_kinesis_blink_step(0, 2);
+        } else if (!zmk_ble_active_profile_is_connected()) {
+            bt_blinking = zmk_kinesis_blink_step(1, 13);
+        }
+        pixels[1] = (bt_idx < NUM_BT_COLORS && !bt_blinking) ? BT_COLORS[bt_idx] : LED_RGB(0x000000);
     }
-    pixels[1] = (bt_idx < NUM_BT_COLORS && !bt_blinking) ? BT_COLORS[bt_idx] : LED_RGB(0x000000);
 
     // set third led to layer state
     pixels[2] = LAYER_COLORS[layer_color_left];

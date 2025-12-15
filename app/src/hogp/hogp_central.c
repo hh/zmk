@@ -40,6 +40,9 @@ static struct bt_uuid_16 hid_service_uuid = BT_UUID_INIT_16(0x1812);
 /* HID Report characteristic UUID: 0x2A4D */
 static struct bt_uuid_16 hid_report_uuid = BT_UUID_INIT_16(0x2A4D);
 
+/* HID Protocol Mode characteristic UUID: 0x2A4E */
+static struct bt_uuid_16 hid_protocol_mode_uuid = BT_UUID_INIT_16(0x2A4E);
+
 /* HOGP device state */
 enum hogp_device_state {
     HOGP_STATE_IDLE,
@@ -60,18 +63,24 @@ enum hogp_discover_phase {
 
 struct hogp_device {
     enum hogp_device_state state;
+    enum hogp_device_type device_type;  /* Mouse or iTrack - set when first report received */
     struct bt_conn *conn;
     struct bt_gatt_discover_params discover_params;
     struct bt_gatt_subscribe_params report_subscribe_params;
     struct bt_gatt_discover_params sub_discover_params;  /* For CCC auto-discovery */
+    struct bt_gatt_read_params read_params;  /* For Protocol Mode read */
     uint16_t service_start_handle;
     uint16_t service_end_handle;
     uint16_t report_handle;
     uint16_t report_ccc_handle;
+    uint16_t protocol_mode_handle;  /* HID Protocol Mode characteristic */
     enum hogp_discover_phase discover_phase;
     bt_addr_le_t addr;
     struct k_work subscribe_work;
     uint8_t security_retry_count;  /* Limit retries to prevent infinite loop */
+    /* Discovery tracking for multi-report devices */
+    uint8_t notify_count;           /* Number of notifiable reports found */
+    uint16_t report_handle_2;       /* Handle of 2nd notifiable report (for M720) */
 };
 
 #define HOGP_MAX_SECURITY_RETRIES 3
@@ -81,6 +90,7 @@ static struct hogp_device hogp_devices[CONFIG_ZMK_HOGP_MAX_DEVICES];
 static bool hogp_pairing_mode = false;  /* Only scan/connect in pairing mode */
 static bool is_scanning = false;
 static bool hogp_reconnect_scanning = false;  /* Scanning for known devices to reconnect */
+static bool hogp_boot_scan = true;  /* First scan after boot uses longer duration */
 
 /* Callback for received HID reports */
 static hogp_report_callback_t report_callback = NULL;
@@ -114,11 +124,11 @@ static void hogp_reconnect_scan_stop_handler(struct k_work *work);
 K_WORK_DELAYABLE_DEFINE(hogp_reconnect_scan_stop_work, hogp_reconnect_scan_stop_handler);
 
 /* How long to wait after boot before auto-reconnect scan (ms) */
-#define HOGP_AUTO_RECONNECT_DELAY_MS 5000
-/* How long to scan for bonded devices during auto-reconnect (seconds) */
-#define HOGP_AUTO_RECONNECT_SCAN_SEC 10
-/* Periodic reconnect check interval (seconds) - faster for mouse wake detection */
-#define HOGP_PERIODIC_RECONNECT_SEC 10
+#define HOGP_AUTO_RECONNECT_DELAY_MS 3000
+/* How long to scan on boot (seconds) - longer to catch sleepy devices */
+#define HOGP_BOOT_SCAN_SEC 15
+/* Periodic reconnect check interval (seconds) - how often to scan for disconnected devices */
+#define HOGP_PERIODIC_RECONNECT_SEC 5
 /* How long each periodic scan burst lasts (seconds) */
 #define HOGP_RECONNECT_SCAN_BURST_SEC 3
 
@@ -129,18 +139,95 @@ static struct hogp_device *hogp_get_free_slot(void);
 static void hogp_remember_addr(const bt_addr_le_t *addr);
 static bool hogp_is_remembered_addr(const bt_addr_le_t *addr);
 
-/* Work handler to subscribe to reports (deferred from security callback) */
-static void hogp_subscribe_work_handler(struct k_work *work) {
-    struct hogp_device *dev = CONTAINER_OF(work, struct hogp_device, subscribe_work);
-    if (dev->state != HOGP_STATE_SUBSCRIBING) {
-        LOG_WRN("Device not in SUBSCRIBING state: %d", dev->state);
+/*
+ * Protocol Mode read callback - called after reading HID Protocol Mode.
+ * The laptop reads this before subscribing, and iTrack may use it to decide
+ * whether to send 20-byte (4-finger) or 23-byte (5-finger) reports.
+ */
+static uint8_t hogp_protocol_mode_read_cb(struct bt_conn *conn, uint8_t err,
+                                           struct bt_gatt_read_params *params,
+                                           const void *data, uint16_t length) {
+    struct hogp_device *dev = hogp_device_for_conn(conn);
+    if (!dev) {
+        LOG_WRN("protocol_mode_read_cb: no device for conn");
+        return BT_GATT_ITER_STOP;
+    }
+
+    if (err) {
+        LOG_WRN("Protocol Mode read failed (err %d), subscribing anyway...", err);
+    } else if (data && length >= 1) {
+        uint8_t protocol_mode = ((const uint8_t *)data)[0];
+        LOG_INF("Protocol Mode = 0x%02x (%s)", protocol_mode,
+                protocol_mode == 0x01 ? "Report Mode" :
+                protocol_mode == 0x00 ? "Boot Mode" : "Unknown");
+    } else {
+        LOG_WRN("Protocol Mode read returned no data");
+    }
+
+    /* Now subscribe to reports */
+    dev->state = HOGP_STATE_SUBSCRIBING;
+    hogp_do_subscribe(dev);
+
+    return BT_GATT_ITER_STOP;
+}
+
+/*
+ * Read Protocol Mode characteristic before subscribing to reports.
+ * This mimics what the laptop does - the iTrack may use this to trigger
+ * full report mode (23-byte 5-finger reports instead of 20-byte 4-finger).
+ */
+static void hogp_read_protocol_mode(struct hogp_device *dev) {
+    if (!dev->protocol_mode_handle) {
+        LOG_INF("No Protocol Mode handle, subscribing directly...");
+        dev->state = HOGP_STATE_SUBSCRIBING;
+        hogp_do_subscribe(dev);
         return;
     }
+
+    LOG_INF("Reading Protocol Mode at handle 0x%04x...", dev->protocol_mode_handle);
+
+    memset(&dev->read_params, 0, sizeof(dev->read_params));
+    dev->read_params.func = hogp_protocol_mode_read_cb;
+    dev->read_params.handle_count = 1;
+    dev->read_params.single.handle = dev->protocol_mode_handle;
+    dev->read_params.single.offset = 0;
+
+    int err = bt_gatt_read(dev->conn, &dev->read_params);
+    if (err) {
+        LOG_ERR("Protocol Mode read failed to start (err %d), subscribing anyway...", err);
+        dev->state = HOGP_STATE_SUBSCRIBING;
+        hogp_do_subscribe(dev);
+    }
+}
+
+/* Work handler to subscribe to reports (deferred from discovery or security callback) */
+static void hogp_subscribe_work_handler(struct k_work *work) {
+    struct hogp_device *dev = CONTAINER_OF(work, struct hogp_device, subscribe_work);
+
+    /*
+     * Select which report to subscribe to:
+     * - iTrack (2 notifiable): use last (trackpad is #2)
+     * - M720 (3+ notifiable): use #2 (mouse input)
+     */
+    if (dev->notify_count > 2 && dev->report_handle_2) {
+        dev->report_handle = dev->report_handle_2;
+        LOG_INF("subscribe_work: %d notifiable, using #2 (M720-style) handle=0x%04x",
+                dev->notify_count, dev->report_handle);
+    } else {
+        LOG_INF("subscribe_work: %d notifiable, using last (iTrack-style) handle=0x%04x",
+                dev->notify_count, dev->report_handle);
+    }
+
     if (!dev->report_handle) {
         LOG_ERR("No report handle in subscribe work");
         return;
     }
-    hogp_do_subscribe(dev);
+
+    /*
+     * Read Protocol Mode before subscribing - this is what the laptop does.
+     * The iTrack may use this to decide whether to send full 5-finger reports.
+     */
+    hogp_read_protocol_mode(dev);
 }
 
 /*
@@ -162,8 +249,23 @@ static uint8_t hogp_report_notify_cb(struct bt_conn *conn,
         return BT_GATT_ITER_STOP;
     }
 
-    LOG_DBG("HID report received: %d bytes", length);
-    LOG_HEXDUMP_DBG(data, length, "HID report");
+    if (zmk_debug_enabled) {
+        LOG_INF("HID report: %d bytes from handle 0x%04x", length, params->value_handle);
+        LOG_HEXDUMP_INF(data, MIN(length, 24), "HID raw");
+    }
+
+    /* Detect and set device type based on report length */
+    struct hogp_device *dev = hogp_device_for_conn(conn);
+    if (dev && dev->device_type == HOGP_DEVICE_UNKNOWN) {
+        /* iTrack sends 20 or 23 byte reports, mice send shorter reports */
+        if (length == 20 || length == 23) {
+            dev->device_type = HOGP_DEVICE_ITRACK;
+            LOG_INF("HOGP: Detected iTrack (report len=%d)", length);
+        } else {
+            dev->device_type = HOGP_DEVICE_MOUSE;
+            LOG_INF("HOGP: Detected Mouse (report len=%d)", length);
+        }
+    }
 
     /* Forward to registered callback if any */
     if (report_callback) {
@@ -334,10 +436,6 @@ static void hogp_scan_recv(const struct bt_le_scan_recv_info *info,
             }
             LOG_INF("Found known HOGP device: %s RSSI:%d - reconnecting", addr_str, info->rssi);
 
-            /* Stop reconnect scan mode and connect */
-            hogp_reconnect_scanning = false;
-            k_work_cancel_delayable(&hogp_reconnect_scan_stop_work);
-
             /* Get a slot and connect */
             struct hogp_device *dev = hogp_get_free_slot();
             if (!dev) {
@@ -348,6 +446,7 @@ static void hogp_scan_recv(const struct bt_le_scan_recv_info *info,
             dev->state = HOGP_STATE_CONNECTING;
             bt_addr_le_copy(&dev->addr, info->addr);
 
+            /* Must stop scan before bt_conn_le_create */
             int err = bt_le_scan_stop();
             if (err && err != -EALREADY) {
                 LOG_WRN("Scan stop returned %d", err);
@@ -361,11 +460,42 @@ static void hogp_scan_recv(const struct bt_le_scan_recv_info *info,
             if (err) {
                 LOG_ERR("Reconnect failed (err %d)", err);
                 dev->state = HOGP_STATE_IDLE;
-                /* Schedule next reconnect attempt */
-                k_work_schedule(&hogp_auto_reconnect_work,
-                                K_SECONDS(HOGP_PERIODIC_RECONNECT_SEC));
             } else {
                 LOG_INF("Reconnection initiated to %s", addr_str);
+            }
+
+            /* Check if we need to reconnect more devices */
+            int connected_count = 0;
+            for (int i = 0; i < CONFIG_ZMK_HOGP_MAX_DEVICES; i++) {
+                if (hogp_devices[i].state != HOGP_STATE_IDLE) {
+                    connected_count++;
+                }
+            }
+
+            if (connected_count < hogp_known_addr_count && hogp_get_free_slot()) {
+                /* More known devices to find - restart scan with fresh timeout */
+                LOG_INF("Connected %d/%d known devices, continuing scan...",
+                        connected_count, hogp_known_addr_count);
+                k_msleep(100);
+                err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, NULL);
+                if (!err) {
+                    is_scanning = true;
+                    /* Reset the scan burst timeout to give more time for remaining devices */
+                    k_work_cancel_delayable(&hogp_reconnect_scan_stop_work);
+                    k_work_schedule(&hogp_reconnect_scan_stop_work,
+                                    K_SECONDS(HOGP_RECONNECT_SCAN_BURST_SEC));
+                } else {
+                    LOG_WRN("Failed to restart scan (err %d)", err);
+                    hogp_reconnect_scanning = false;
+                    k_work_cancel_delayable(&hogp_reconnect_scan_stop_work);
+                    k_work_schedule(&hogp_auto_reconnect_work,
+                                    K_SECONDS(HOGP_PERIODIC_RECONNECT_SEC));
+                }
+            } else {
+                /* All known devices connected or no free slots */
+                LOG_INF("All %d known devices connected", connected_count);
+                hogp_reconnect_scanning = false;
+                k_work_cancel_delayable(&hogp_reconnect_scan_stop_work);
             }
         }
         /* During reconnect scanning, only look for known devices */
@@ -583,7 +713,9 @@ void hogp_start_reconnect_scan(void) {
         return;
     }
 
-    LOG_INF("Starting reconnect scan burst (%d sec)", HOGP_RECONNECT_SCAN_BURST_SEC);
+    /* Use longer scan duration on boot to catch sleepy devices */
+    int scan_duration = hogp_boot_scan ? HOGP_BOOT_SCAN_SEC : HOGP_RECONNECT_SCAN_BURST_SEC;
+    LOG_INF("Starting reconnect scan (%d sec, boot=%d)", scan_duration, hogp_boot_scan);
     hogp_reconnect_scanning = true;
 
     /* Start passive scan - lower power, catches devices waking up */
@@ -599,7 +731,10 @@ void hogp_start_reconnect_scan(void) {
     is_scanning = true;
 
     /* Schedule scan stop */
-    k_work_schedule(&hogp_reconnect_scan_stop_work, K_SECONDS(HOGP_RECONNECT_SCAN_BURST_SEC));
+    k_work_schedule(&hogp_reconnect_scan_stop_work, K_SECONDS(scan_duration));
+
+    /* After first scan, use shorter periodic duration */
+    hogp_boot_scan = false;
 }
 
 /*
@@ -720,8 +855,14 @@ static uint8_t hogp_discover_cb(struct bt_conn *conn,
                                 struct bt_gatt_discover_params *params) {
     struct hogp_device *dev = hogp_device_for_conn(conn);
     if (!dev) {
+        LOG_WRN("discover_cb: no device for conn!");
         return BT_GATT_ITER_STOP;
     }
+
+    char addr_str[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(&dev->addr, addr_str, sizeof(addr_str));
+    LOG_INF("discover_cb: %s phase=%d attr=%s notify_cnt=%d",
+            addr_str, dev->discover_phase, attr ? "valid" : "NULL", dev->notify_count);
 
     if (!attr) {
         if (dev->discover_phase == HOGP_DISCOVER_SERVICE) {
@@ -733,8 +874,21 @@ static uint8_t hogp_discover_cb(struct bt_conn *conn,
         } else if (dev->discover_phase == HOGP_DISCOVER_CHARACTERISTICS) {
             dev->discover_phase = HOGP_DISCOVER_COMPLETE;
 
+            /*
+             * Select which report to subscribe to:
+             * - iTrack (2 notifiable): use last (trackpad is #2)
+             * - M720 (4 notifiable): use #2 (mouse input)
+             * Rule: if >2 notifiable reports, use #2; otherwise use last
+             */
+            if (dev->notify_count > 2 && dev->report_handle_2) {
+                dev->report_handle = dev->report_handle_2;
+                LOG_INF("Discovery: %d notifiable reports, using #2 (M720-style)", dev->notify_count);
+            } else {
+                LOG_INF("Discovery: %d notifiable reports, using last (iTrack-style)", dev->notify_count);
+            }
+
             if (dev->report_handle) {
-                LOG_INF("Discovery complete, subscribing to reports...");
+                LOG_INF("Subscribing to handle 0x%04x...", dev->report_handle);
                 hogp_subscribe_to_reports(dev);
             } else {
                 LOG_WRN("No HID report characteristic found");
@@ -760,7 +914,9 @@ static uint8_t hogp_discover_cb(struct bt_conn *conn,
          * Instead, we stop here and manually start characteristic discovery.
          */
         dev->discover_phase = HOGP_DISCOVER_CHARACTERISTICS;
-        dev->discover_params.uuid = &hid_report_uuid.uuid;
+        dev->protocol_mode_handle = 0;
+        /* Discover ALL characteristics to find both Report and Protocol Mode */
+        dev->discover_params.uuid = NULL;
         dev->discover_params.start_handle = dev->service_start_handle;
         dev->discover_params.end_handle = dev->service_end_handle;
         dev->discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
@@ -774,25 +930,47 @@ static uint8_t hogp_discover_cb(struct bt_conn *conn,
 
     } else if (dev->discover_phase == HOGP_DISCOVER_CHARACTERISTICS) {
         struct bt_gatt_chrc *chrc = attr->user_data;
-        static int report_count = 0;  /* Track which report we're on */
 
-        LOG_INF("Found HID Report #%d at handle 0x%04x (value: 0x%04x) props=0x%02x",
-                report_count + 1, attr->handle, chrc->value_handle, chrc->properties);
+        /* Check if this is Protocol Mode characteristic (0x2A4E) */
+        if (bt_uuid_cmp(chrc->uuid, &hid_protocol_mode_uuid.uuid) == 0) {
+            dev->protocol_mode_handle = chrc->value_handle;
+            LOG_INF("Found Protocol Mode at handle 0x%04x", chrc->value_handle);
+            return BT_GATT_ITER_CONTINUE;
+        }
+
+        /* Check if this is a Report characteristic (0x2A4D) */
+        if (bt_uuid_cmp(chrc->uuid, &hid_report_uuid.uuid) != 0) {
+            /* Not a Report, skip it */
+            return BT_GATT_ITER_CONTINUE;
+        }
+
+        LOG_INF("Found HID Report at handle 0x%04x (value: 0x%04x) props=0x%02x",
+                attr->handle, chrc->value_handle, chrc->properties);
 
         if (chrc->properties & BT_GATT_CHRC_NOTIFY) {
-            report_count++;
-            /* M720 has 4 HID reports - the 2nd one (0x0030) is mouse input (7 bytes)
-             * Report #3 (0x0034) is Logitech HID++ protocol (19 bytes) - not standard mouse
+            dev->notify_count++;
+            LOG_INF("  -> Notifiable #%d (handle 0x%04x)", dev->notify_count, chrc->value_handle);
+
+            /* Save handle #2 for M720-style devices (4 notifiable reports) */
+            if (dev->notify_count == 2) {
+                dev->report_handle_2 = chrc->value_handle;
+            }
+            /* Always save last as fallback (works for iTrack with 2 reports) */
+            dev->report_handle = chrc->value_handle;
+
+            /*
+             * Subscribe immediately when we have enough info:
+             * - After 2 notifiable reports (covers iTrack)
+             * - Or after 3+ (use #2 for M720-style)
+             * Zephyr characteristic discovery doesn't call back with NULL,
+             * so we must decide when to stop ourselves.
              */
-            if (report_count == 2) {
-                LOG_INF("This is report #2 (mouse input) - subscribing now");
-                dev->report_handle = chrc->value_handle;
+            if (dev->notify_count >= 2) {
+                /* Use a delayed work to subscribe after discovery settles */
+                k_work_submit(&dev->subscribe_work);
                 dev->discover_phase = HOGP_DISCOVER_COMPLETE;
-                report_count = 0;  /* Reset for next device */
-                hogp_subscribe_to_reports(dev);
                 return BT_GATT_ITER_STOP;
             }
-            LOG_INF("Skipping report #%d, looking for #2", report_count);
         }
         return BT_GATT_ITER_CONTINUE;
     }
@@ -809,6 +987,8 @@ static void hogp_start_discovery(struct hogp_device *dev) {
     dev->service_start_handle = 0;
     dev->service_end_handle = 0;
     dev->report_handle = 0;
+    dev->notify_count = 0;
+    dev->report_handle_2 = 0;
 
     dev->discover_params.uuid = &hid_service_uuid.uuid;
     dev->discover_params.func = hogp_discover_cb;
@@ -1117,6 +1297,42 @@ enum hogp_indicator_state hogp_get_indicator_state(void) {
 
     /* No known devices - idle state */
     return HOGP_INDICATOR_IDLE;
+}
+
+/*
+ * Get indicator state for a specific device type (mouse or iTrack)
+ */
+enum hogp_indicator_state hogp_get_device_indicator_state(enum hogp_device_type type) {
+    /* Check if a device of this type is connected */
+    for (int i = 0; i < CONFIG_ZMK_HOGP_MAX_DEVICES; i++) {
+        if (hogp_devices[i].device_type == type &&
+            hogp_devices[i].state >= HOGP_STATE_CONNECTED) {
+            return HOGP_INDICATOR_CONNECTED;
+        }
+    }
+
+    /* Check if in pairing/scanning mode */
+    if (hogp_pairing_mode) {
+        return HOGP_INDICATOR_PAIRING;
+    }
+
+    if (hogp_reconnect_scanning) {
+        return HOGP_INDICATOR_SCANNING;
+    }
+
+    /* Not connected */
+    return HOGP_INDICATOR_IDLE;
+}
+
+/*
+ * Set the device type for a slot (called when first report received)
+ */
+void hogp_set_device_type(struct bt_conn *conn, enum hogp_device_type type) {
+    struct hogp_device *dev = hogp_device_for_conn(conn);
+    if (dev) {
+        dev->device_type = type;
+        LOG_INF("HOGP: Device type set to %s", type == HOGP_DEVICE_MOUSE ? "MOUSE" : "ITRACK");
+    }
 }
 
 /*

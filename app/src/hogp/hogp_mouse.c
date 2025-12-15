@@ -88,7 +88,7 @@ static void process_mouse_report(const uint8_t *data, uint16_t len) {
     zmk_endpoints_send_mouse_report();
 
     /* Debug logging for non-trivial events */
-    if (buttons || x_raw || y_raw || wheel || hscroll) {
+    if (zmk_debug_enabled && (buttons || x_raw || y_raw || wheel || hscroll)) {
         LOG_DBG("Mouse: btn=0x%02x x=%d y=%d wheel=%d hscroll=%d",
                 buttons, x_raw, y_raw, wheel, hscroll);
     }
@@ -150,7 +150,9 @@ static bool parse_trackpad_finger(const uint8_t *finger, uint16_t *x, uint16_t *
  */
 static void process_trackpad_report(const uint8_t *data, uint16_t len) {
     if (len < TRACKPAD_REPORT_LEN) {
-        LOG_DBG("Trackpad report too short: %d bytes", len);
+        if (zmk_debug_enabled) {
+            LOG_DBG("Trackpad report too short: %d bytes", len);
+        }
         return;
     }
 
@@ -164,7 +166,9 @@ static void process_trackpad_report(const uint8_t *data, uint16_t len) {
         zmk_hid_mouse_clear();
         if (button) {
             zmk_hid_mouse_button_press(0);
-            LOG_INF("Trackpad click");
+            if (zmk_debug_enabled) {
+                LOG_INF("Trackpad click");
+            }
         } else {
             zmk_hid_mouse_button_release(0);
         }
@@ -180,7 +184,9 @@ static void process_trackpad_report(const uint8_t *data, uint16_t len) {
         primary_finger.has_prev = false;
         scroll_track.has_prev = false;
         prev_contact_count = contact_count;
-        LOG_DBG("Trackpad mode: %d fingers", contact_count);
+        if (zmk_debug_enabled) {
+            LOG_DBG("Trackpad mode: %d fingers", contact_count);
+        }
     }
 
     if (contact_count == 2) {
@@ -239,15 +245,35 @@ static void process_trackpad_report(const uint8_t *data, uint16_t len) {
 }
 
 /*============================================================================
- * Report Dispatcher - Detects device type by report length
+ * Report Dispatcher - Routes reports to appropriate handler by length
  *============================================================================*/
 
+#if IS_ENABLED(CONFIG_ZMK_HOGP_ITRACK_OUTPUT)
+/* iTrack handler in hogp_itrack.c */
+extern void hogp_itrack_process(const uint8_t *data, uint16_t len);
+#define ITRACK_REPORT_LEN_FINGERS 20
+#define ITRACK_REPORT_LEN_FULL 23
+#define ITRACK_KEYBOARD_LEN 8
+#endif
+
 static void hogp_mouse_process_report(const uint8_t *data, uint16_t len) {
-    LOG_DBG("HID report received: %d bytes", len);
+    if (zmk_debug_enabled) {
+        LOG_DBG("HID report received: %d bytes", len);
+    }
 
     if (len == MOUSE_REPORT_LEN) {
         /* Standard mouse (e.g., Logitech M720) */
         process_mouse_report(data, len);
+#if IS_ENABLED(CONFIG_ZMK_HOGP_ITRACK_OUTPUT)
+    } else if (len == ITRACK_REPORT_LEN_FINGERS || len == ITRACK_REPORT_LEN_FULL) {
+        /* Brydge iTrack ADG trackpad */
+        hogp_itrack_process(data, len);
+    } else if (len == ITRACK_KEYBOARD_LEN) {
+        /* iTrack keyboard report - ignore */
+        if (zmk_debug_enabled) {
+            LOG_DBG("Ignoring iTrack keyboard report");
+        }
+#endif
     } else if (len == TRACKPAD_REPORT_LEN) {
         /* Multitouch trackpad (e.g., ProtoArc) */
         process_trackpad_report(data, len);

@@ -118,6 +118,8 @@ int zmk_endpoints_toggle_transport(void) {
 
 struct zmk_endpoint_instance zmk_endpoints_selected(void) { return current_instance; }
 
+enum zmk_transport zmk_endpoints_preferred_transport(void) { return preferred_transport; }
+
 static int send_keyboard_report(void) {
     switch (current_instance.transport) {
     case ZMK_TRANSPORT_USB: {
@@ -236,6 +238,42 @@ int zmk_endpoints_send_mouse_report() {
     return -ENOTSUP;
 }
 #endif // IS_ENABLED(CONFIG_ZMK_POINTING)
+
+#if IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT) || IS_ENABLED(CONFIG_ZMK_HOGP_ITRACK_OUTPUT)
+int zmk_endpoints_send_trackpad_report() {
+    switch (current_instance.transport) {
+    case ZMK_TRANSPORT_USB: {
+#if IS_ENABLED(CONFIG_ZMK_USB)
+        int err = zmk_usb_hid_send_trackpad_report();
+        if (err) {
+            LOG_ERR("FAILED TO SEND TRACKPAD OVER USB: %d", err);
+        }
+        return err;
+#else
+        LOG_ERR("USB endpoint is not supported");
+        return -ENOTSUP;
+#endif /* IS_ENABLED(CONFIG_ZMK_USB) */
+    }
+
+    case ZMK_TRANSPORT_BLE: {
+#if IS_ENABLED(CONFIG_ZMK_BLE)
+        struct zmk_hid_trackpad_report *report = zmk_hid_get_trackpad_report();
+        int err = zmk_hog_send_trackpad_report(&report->body);
+        if (err) {
+            LOG_ERR("FAILED TO SEND TRACKPAD OVER HOG: %d", err);
+        }
+        return err;
+#else
+        LOG_ERR("BLE HOG endpoint is not supported");
+        return -ENOTSUP;
+#endif /* IS_ENABLED(CONFIG_ZMK_BLE) */
+    }
+    }
+
+    LOG_ERR("Unhandled endpoint transport %d", current_instance.transport);
+    return -ENOTSUP;
+}
+#endif // CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT || CONFIG_ZMK_HOGP_ITRACK_OUTPUT
 
 #if IS_ENABLED(CONFIG_SETTINGS)
 

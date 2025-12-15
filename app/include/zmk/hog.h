@@ -16,6 +16,6 @@ int zmk_hog_send_consumer_report(struct zmk_hid_consumer_report_body *body);
 int zmk_hog_send_mouse_report(struct zmk_hid_mouse_report_body *body);
 #endif // IS_ENABLED(CONFIG_ZMK_POINTING)
 
-#if IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT)
+#if IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT) || IS_ENABLED(CONFIG_ZMK_HOGP_ITRACK_OUTPUT)
 int zmk_hog_send_trackpad_report(struct zmk_hid_trackpad_report_body *body);
-#endif // IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT)
+#endif // CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT || CONFIG_ZMK_HOGP_ITRACK_OUTPUT

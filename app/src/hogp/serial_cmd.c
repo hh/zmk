@@ -59,6 +59,9 @@ static char cmd_buf[SERIAL_CMD_MAX_LEN];
 static int cmd_pos = 0;
 static bool cmd_active = false;  /* True after seeing '!' prefix */
 
+/* Global debug flag - can be toggled at runtime via !debug / !nodebug */
+bool zmk_debug_enabled = false;
+
 #define CMD_PREFIX '!'
 
 static void process_command(const char *cmd) {
@@ -146,8 +149,31 @@ static void process_command(const char *cmd) {
         hogp_dump_nvs_state();
 #endif /* CONFIG_ZMK_HOGP */
 
+    } else if (strncmp(cmd, "profiles", 8) == 0 || strncmp(cmd, "prof", 4) == 0) {
+        /* Show BLE profile status */
+        LOG_INF("=== BLE Profiles ===");
+        int active = zmk_ble_active_profile_index();
+        LOG_INF("Active profile: %d / %d", active, ZMK_BLE_PROFILE_COUNT);
+        bt_addr_le_t *addr = zmk_ble_active_profile_addr();
+        if (addr && bt_addr_le_cmp(addr, BT_ADDR_LE_ANY) != 0) {
+            char addr_str[BT_ADDR_LE_STR_LEN];
+            bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
+            LOG_INF("Active profile addr: %s", addr_str);
+        } else {
+            LOG_INF("Active profile addr: (empty/unpaired)");
+        }
+        LOG_INF("====================");
+
+    } else if (strncmp(cmd, "debug", 5) == 0) {
+        zmk_debug_enabled = true;
+        LOG_INF("Debug logging ENABLED");
+
+    } else if (strncmp(cmd, "nodebug", 7) == 0) {
+        zmk_debug_enabled = false;
+        LOG_INF("Debug logging DISABLED");
+
     } else if (strncmp(cmd, "help", 4) == 0) {
-        LOG_INF("Commands: !reboot, !boot, !ble, !usb, !forget"
+        LOG_INF("Commands: !reboot, !boot, !ble, !usb, !forget, !prof, !debug, !nodebug"
 #if IS_ENABLED(CONFIG_ZMK_HOGP)
                 ", !pair, !unpair, !hogp, !clear, !clearhosts"
 #endif

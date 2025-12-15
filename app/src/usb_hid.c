@@ -28,9 +28,18 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 static const struct device *hid_dev;
 
+#if IS_ENABLED(CONFIG_ZMK_USB_HID_TRACKPAD_INTERFACE)
+static const struct device *hid_trackpad_dev;
+static K_SEM_DEFINE(hid_trackpad_sem, 1, 1);
+#endif
+
 static K_SEM_DEFINE(hid_sem, 1, 1);
 
 static void in_ready_cb(const struct device *dev) { k_sem_give(&hid_sem); }
+
+#if IS_ENABLED(CONFIG_ZMK_USB_HID_TRACKPAD_INTERFACE)
+static void in_ready_trackpad_cb(const struct device *dev) { k_sem_give(&hid_trackpad_sem); }
+#endif
 
 #define HID_GET_REPORT_TYPE_MASK 0xff00
 #define HID_GET_REPORT_ID_MASK 0x00ff
@@ -182,6 +191,13 @@ static const struct hid_ops ops = {
     .set_report = set_report_cb,
 };
 
+#if IS_ENABLED(CONFIG_ZMK_USB_HID_TRACKPAD_INTERFACE)
+static const struct hid_ops trackpad_ops = {
+    .int_in_ready = in_ready_trackpad_cb,
+    /* No get_report or set_report - trackpad only sends input reports */
+};
+#endif
+
 static int zmk_usb_hid_send_report(const uint8_t *report, size_t len) {
     switch (zmk_usb_get_status()) {
     case USB_DC_SUSPEND:
@@ -233,6 +249,42 @@ int zmk_usb_hid_send_mouse_report() {
 }
 #endif // IS_ENABLED(CONFIG_ZMK_POINTING)
 
+#if IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT) || IS_ENABLED(CONFIG_ZMK_HOGP_ITRACK_OUTPUT)
+int zmk_usb_hid_send_trackpad_report() {
+#if IS_ENABLED(CONFIG_ZMK_USB_BOOT)
+    if (hid_protocol == HID_PROTOCOL_BOOT) {
+        return -ENOTSUP;
+    }
+#endif /* IS_ENABLED(CONFIG_ZMK_USB_BOOT) */
+
+    struct zmk_hid_trackpad_report *report = zmk_hid_get_trackpad_report();
+
+#if IS_ENABLED(CONFIG_ZMK_USB_HID_TRACKPAD_INTERFACE)
+    /* Send trackpad reports to HID_1 (separate interface for hid-multitouch) */
+    switch (zmk_usb_get_status()) {
+    case USB_DC_SUSPEND:
+        return usb_wakeup_request();
+    case USB_DC_ERROR:
+    case USB_DC_RESET:
+    case USB_DC_DISCONNECTED:
+    case USB_DC_UNKNOWN:
+        return -ENODEV;
+    default:
+        k_sem_take(&hid_trackpad_sem, K_MSEC(30));
+        int err = hid_int_ep_write(hid_trackpad_dev, (uint8_t *)report, sizeof(*report), NULL);
+
+        if (err) {
+            k_sem_give(&hid_trackpad_sem);
+        }
+
+        return err;
+    }
+#else
+    return zmk_usb_hid_send_report((uint8_t *)report, sizeof(*report));
+#endif
+}
+#endif // CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT || CONFIG_ZMK_HOGP_ITRACK_OUTPUT
+
 static int zmk_usb_hid_init(void) {
     hid_dev = device_get_binding("HID_0");
     if (hid_dev == NULL) {
@@ -240,13 +292,28 @@ static int zmk_usb_hid_init(void) {
         return -EINVAL;
     }
 
-    usb_hid_register_device(hid_dev, zmk_hid_report_desc, sizeof(zmk_hid_report_desc), &ops);
+    /* For USB HID_0: register without trackpad section if using separate trackpad interface */
+    usb_hid_register_device(hid_dev, zmk_hid_report_desc, ZMK_HID_REPORT_DESC_USB_SIZE, &ops);
 
 #if IS_ENABLED(CONFIG_ZMK_USB_BOOT)
     usb_hid_set_proto_code(hid_dev, HID_BOOT_IFACE_CODE_KEYBOARD);
 #endif /* IS_ENABLED(CONFIG_ZMK_USB_BOOT) */
 
     usb_hid_init(hid_dev);
+
+#if IS_ENABLED(CONFIG_ZMK_USB_HID_TRACKPAD_INTERFACE)
+    /* Initialize HID_1 for trackpad (separate interface for hid-multitouch on Linux) */
+    hid_trackpad_dev = device_get_binding("HID_1");
+    if (hid_trackpad_dev == NULL) {
+        LOG_ERR("Unable to locate HID trackpad device (HID_1)");
+        return -EINVAL;
+    }
+
+    usb_hid_register_device(hid_trackpad_dev, zmk_hid_trackpad_desc, sizeof(zmk_hid_trackpad_desc),
+                            &trackpad_ops);
+    usb_hid_init(hid_trackpad_dev);
+    LOG_INF("USB HID trackpad interface initialized (HID_1)");
+#endif
 
     return 0;
 }

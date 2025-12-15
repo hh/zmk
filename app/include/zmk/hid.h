@@ -255,7 +255,223 @@ static const uint8_t zmk_hid_report_desc[] = {
     HID_END_COLLECTION,
 #endif // IS_ENABLED(CONFIG_ZMK_POINTING)
 
-#if IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT)
+#if IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT) || IS_ENABLED(CONFIG_ZMK_HOGP_ITRACK_OUTPUT)
+    /* ADG Chapter 15 Trackpad - Touch Pad Application
+     * For USB with CONFIG_ZMK_USB_HID_TRACKPAD_INTERFACE: trackpad is on HID_1
+     * For BLE: trackpad is included in this descriptor
+     */
+    0x05, 0x0D,             /* USAGE_PAGE (Digitizers) */
+    0x09, 0x05,             /* USAGE (Touch Pad) */
+    0xA1, 0x01,             /* COLLECTION (Application) */
+    0x85, ZMK_HID_REPORT_ID_TRACKPAD, /* REPORT_ID (4) */
+
+    /* Scan Time (16-bit, 100us units) */
+    0x05, 0x0D,             /*   USAGE_PAGE (Digitizers) */
+    0x09, 0x56,             /*   USAGE (Scan Time) */
+    0x15, 0x00,             /*   LOGICAL_MINIMUM (0) */
+    0x27, 0xFF, 0xFF, 0x00, 0x00, /* LOGICAL_MAXIMUM (65535) */
+    0x75, 0x10,             /*   REPORT_SIZE (16) */
+    0x95, 0x01,             /*   REPORT_COUNT (1) */
+    0x81, 0x02,             /*   INPUT (Data,Var,Abs) */
+
+    /* Buttons (2 bits + 6 padding) */
+    0x05, 0x09,             /*   USAGE_PAGE (Button) */
+    0x19, 0x01,             /*   USAGE_MINIMUM (Button 1) */
+    0x29, 0x02,             /*   USAGE_MAXIMUM (Button 2) */
+    0x15, 0x00,             /*   LOGICAL_MINIMUM (0) */
+    0x25, 0x01,             /*   LOGICAL_MAXIMUM (1) */
+    0x75, 0x01,             /*   REPORT_SIZE (1) */
+    0x95, 0x02,             /*   REPORT_COUNT (2) */
+    0x81, 0x02,             /*   INPUT (Data,Var,Abs) */
+    0x95, 0x06,             /*   REPORT_COUNT (6) */
+    0x81, 0x01,             /*   INPUT (Const) - padding */
+
+    /* Finger 0 */
+    0x05, 0x0D,             /* USAGE_PAGE (Digitizers) */
+    0x09, 0x22,             /* USAGE (Finger) */
+    0xA1, 0x02,             /* COLLECTION (Logical) */
+    0x09, 0x42,             /*   USAGE (Tip Switch) */
+    0x09, 0x47,             /*   USAGE (Confidence) */
+    0x15, 0x00,             /*   LOGICAL_MINIMUM (0) */
+    0x25, 0x01,             /*   LOGICAL_MAXIMUM (1) */
+    0x75, 0x01,             /*   REPORT_SIZE (1) */
+    0x95, 0x02,             /*   REPORT_COUNT (2) */
+    0x81, 0x02,             /*   INPUT (Data,Var,Abs) */
+    0x09, 0x38,             /*   USAGE (Transducer Index) */
+    0x25, 0x04,             /*   LOGICAL_MAXIMUM (4) */
+    0x75, 0x06,             /*   REPORT_SIZE (6) */
+    0x95, 0x01,             /*   REPORT_COUNT (1) */
+    0x81, 0x02,             /*   INPUT (Data,Var,Abs) */
+    0x05, 0x01,             /*   USAGE_PAGE (Generic Desktop) */
+    0x09, 0x30,             /*   USAGE (X) */
+    0x15, 0x00,             /*   LOGICAL_MINIMUM (0) */
+    0x26, 0x40, 0x06,       /*   LOGICAL_MAXIMUM (1600) - iTrack X range */
+    0x35, 0x00,             /*   PHYSICAL_MINIMUM (0) */
+    0x46, 0x50, 0x05,       /*   PHYSICAL_MAXIMUM (1360) = 136.0mm iTrack */
+    0x55, 0x0E,             /*   UNIT_EXPONENT (-2) */
+    0x65, 0x11,             /*   UNIT (cm) */
+    0x75, 0x0C,             /*   REPORT_SIZE (12) */
+    0x95, 0x01,             /*   REPORT_COUNT (1) */
+    0x81, 0x02,             /*   INPUT (Data,Var,Abs) */
+    0x09, 0x31,             /*   USAGE (Y) */
+    0x26, 0xB6, 0x03,       /*   LOGICAL_MAXIMUM (950) - iTrack Y range */
+    0x46, 0x5C, 0x03,       /*   PHYSICAL_MAXIMUM (860) = 86.0mm iTrack */
+    0x81, 0x02,             /*   INPUT (Data,Var,Abs) */
+    0xC0,                   /* END_COLLECTION */
+
+    /* Finger 1 */
+    0x05, 0x0D,
+    0x09, 0x22,
+    0xA1, 0x02,
+    0x09, 0x42,
+    0x09, 0x47,
+    0x15, 0x00,
+    0x25, 0x01,
+    0x75, 0x01,
+    0x95, 0x02,
+    0x81, 0x02,
+    0x09, 0x38,
+    0x25, 0x04,
+    0x75, 0x06,
+    0x95, 0x01,
+    0x81, 0x02,
+    0x05, 0x01,
+    0x09, 0x30,
+    0x15, 0x00,
+    0x26, 0x40, 0x06,       /* X LOGICAL_MAX (1600) */
+    0x35, 0x00,
+    0x46, 0x50, 0x05,       /* X PHYSICAL_MAX (1360) = 136mm */
+    0x55, 0x0E,
+    0x65, 0x11,
+    0x75, 0x0C,
+    0x95, 0x01,
+    0x81, 0x02,
+    0x09, 0x31,
+    0x26, 0xB6, 0x03,       /* Y LOGICAL_MAX (950) */
+    0x46, 0x5C, 0x03,       /* Y PHYSICAL_MAX (860) = 86mm */
+    0x81, 0x02,
+    0xC0,
+
+    /* Finger 2 */
+    0x05, 0x0D,
+    0x09, 0x22,
+    0xA1, 0x02,
+    0x09, 0x42,
+    0x09, 0x47,
+    0x15, 0x00,
+    0x25, 0x01,
+    0x75, 0x01,
+    0x95, 0x02,
+    0x81, 0x02,
+    0x09, 0x38,
+    0x25, 0x04,
+    0x75, 0x06,
+    0x95, 0x01,
+    0x81, 0x02,
+    0x05, 0x01,
+    0x09, 0x30,
+    0x15, 0x00,
+    0x26, 0x40, 0x06,       /* X LOGICAL_MAX (1600) */
+    0x35, 0x00,
+    0x46, 0x50, 0x05,       /* X PHYSICAL_MAX (1360) = 136mm */
+    0x55, 0x0E,
+    0x65, 0x11,
+    0x75, 0x0C,
+    0x95, 0x01,
+    0x81, 0x02,
+    0x09, 0x31,
+    0x26, 0xB6, 0x03,       /* Y LOGICAL_MAX (950) */
+    0x46, 0x5C, 0x03,       /* Y PHYSICAL_MAX (860) = 86mm */
+    0x81, 0x02,
+    0xC0,
+
+    /* Finger 3 */
+    0x05, 0x0D,
+    0x09, 0x22,
+    0xA1, 0x02,
+    0x09, 0x42,
+    0x09, 0x47,
+    0x15, 0x00,
+    0x25, 0x01,
+    0x75, 0x01,
+    0x95, 0x02,
+    0x81, 0x02,
+    0x09, 0x38,
+    0x25, 0x04,
+    0x75, 0x06,
+    0x95, 0x01,
+    0x81, 0x02,
+    0x05, 0x01,
+    0x09, 0x30,
+    0x15, 0x00,
+    0x26, 0x40, 0x06,       /* X LOGICAL_MAX (1600) */
+    0x35, 0x00,
+    0x46, 0x50, 0x05,       /* X PHYSICAL_MAX (1360) = 136mm */
+    0x55, 0x0E,
+    0x65, 0x11,
+    0x75, 0x0C,
+    0x95, 0x01,
+    0x81, 0x02,
+    0x09, 0x31,
+    0x26, 0xB6, 0x03,       /* Y LOGICAL_MAX (950) */
+    0x46, 0x5C, 0x03,       /* Y PHYSICAL_MAX (860) = 86mm */
+    0x81, 0x02,
+    0xC0,
+
+    /* Finger 4 */
+    0x05, 0x0D,
+    0x09, 0x22,
+    0xA1, 0x02,
+    0x09, 0x42,
+    0x09, 0x47,
+    0x15, 0x00,
+    0x25, 0x01,
+    0x75, 0x01,
+    0x95, 0x02,
+    0x81, 0x02,
+    0x09, 0x38,
+    0x25, 0x04,
+    0x75, 0x06,
+    0x95, 0x01,
+    0x81, 0x02,
+    0x05, 0x01,
+    0x09, 0x30,
+    0x15, 0x00,
+    0x26, 0x40, 0x06,       /* X LOGICAL_MAX (1600) */
+    0x35, 0x00,
+    0x46, 0x50, 0x05,       /* X PHYSICAL_MAX (1360) = 136mm */
+    0x55, 0x0E,
+    0x65, 0x11,
+    0x75, 0x0C,
+    0x95, 0x01,
+    0x81, 0x02,
+    0x09, 0x31,
+    0x26, 0xB6, 0x03,       /* Y LOGICAL_MAX (950) */
+    0x46, 0x5C, 0x03,       /* Y PHYSICAL_MAX (860) = 86mm */
+    0x81, 0x02,
+    0xC0,
+
+    0xC0,                   /* END_COLLECTION (Application) */
+#endif // CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT || CONFIG_ZMK_HOGP_ITRACK_OUTPUT
+};
+
+/* Size of the trackpad portion in zmk_hid_report_desc (for USB HID_0 to exclude it) */
+#if IS_ENABLED(CONFIG_ZMK_USB_HID_TRACKPAD_INTERFACE) && \
+    (IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT) || IS_ENABLED(CONFIG_ZMK_HOGP_ITRACK_OUTPUT))
+#define ZMK_HID_TRACKPAD_DESC_SIZE sizeof(zmk_hid_trackpad_desc)
+#define ZMK_HID_REPORT_DESC_USB_SIZE (sizeof(zmk_hid_report_desc) - ZMK_HID_TRACKPAD_DESC_SIZE)
+#else
+#define ZMK_HID_REPORT_DESC_USB_SIZE sizeof(zmk_hid_report_desc)
+#endif
+
+/*
+ * Standalone trackpad descriptor for USB HID_1 interface.
+ * Used when CONFIG_ZMK_USB_HID_TRACKPAD_INTERFACE is enabled.
+ * This allows hid-multitouch to bind to trackpad while hid-generic handles keyboard/mouse.
+ */
+#if IS_ENABLED(CONFIG_ZMK_USB_HID_TRACKPAD_INTERFACE) && \
+    (IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT) || IS_ENABLED(CONFIG_ZMK_HOGP_ITRACK_OUTPUT))
+static const uint8_t zmk_hid_trackpad_desc[] = {
     /* ADG Chapter 15 Trackpad - Touch Pad Application */
     0x05, 0x0D,             /* USAGE_PAGE (Digitizers) */
     0x09, 0x05,             /* USAGE (Touch Pad) */
@@ -302,17 +518,17 @@ static const uint8_t zmk_hid_report_desc[] = {
     0x05, 0x01,             /*   USAGE_PAGE (Generic Desktop) */
     0x09, 0x30,             /*   USAGE (X) */
     0x15, 0x00,             /*   LOGICAL_MINIMUM (0) */
-    0x26, 0xFD, 0x09,       /*   LOGICAL_MAXIMUM (2557) */
+    0x26, 0x40, 0x06,       /*   LOGICAL_MAXIMUM (1600) - iTrack X range */
     0x35, 0x00,             /*   PHYSICAL_MINIMUM (0) */
-    0x46, 0x72, 0x06,       /*   PHYSICAL_MAXIMUM (1650) = 165.0mm */
+    0x46, 0x50, 0x05,       /*   PHYSICAL_MAXIMUM (1360) = 136.0mm iTrack */
     0x55, 0x0E,             /*   UNIT_EXPONENT (-2) */
     0x65, 0x11,             /*   UNIT (cm) */
     0x75, 0x0C,             /*   REPORT_SIZE (12) */
     0x95, 0x01,             /*   REPORT_COUNT (1) */
     0x81, 0x02,             /*   INPUT (Data,Var,Abs) */
     0x09, 0x31,             /*   USAGE (Y) */
-    0x26, 0x82, 0x04,       /*   LOGICAL_MAXIMUM (1154) */
-    0x46, 0x4C, 0x04,       /*   PHYSICAL_MAXIMUM (1100) = 110.0mm */
+    0x26, 0xB6, 0x03,       /*   LOGICAL_MAXIMUM (950) - iTrack Y range */
+    0x46, 0x5C, 0x03,       /*   PHYSICAL_MAXIMUM (860) = 86.0mm iTrack */
     0x81, 0x02,             /*   INPUT (Data,Var,Abs) */
     0xC0,                   /* END_COLLECTION */
 
@@ -335,17 +551,17 @@ static const uint8_t zmk_hid_report_desc[] = {
     0x05, 0x01,
     0x09, 0x30,
     0x15, 0x00,
-    0x26, 0xFD, 0x09,
+    0x26, 0x40, 0x06,       /* X LOGICAL_MAX (1600) */
     0x35, 0x00,
-    0x46, 0x72, 0x06,
+    0x46, 0x50, 0x05,       /* X PHYSICAL_MAX (1360) = 136mm */
     0x55, 0x0E,
     0x65, 0x11,
     0x75, 0x0C,
     0x95, 0x01,
     0x81, 0x02,
     0x09, 0x31,
-    0x26, 0x82, 0x04,
-    0x46, 0x4C, 0x04,
+    0x26, 0xB6, 0x03,       /* Y LOGICAL_MAX (950) */
+    0x46, 0x5C, 0x03,       /* Y PHYSICAL_MAX (860) = 86mm */
     0x81, 0x02,
     0xC0,
 
@@ -368,17 +584,17 @@ static const uint8_t zmk_hid_report_desc[] = {
     0x05, 0x01,
     0x09, 0x30,
     0x15, 0x00,
-    0x26, 0xFD, 0x09,
+    0x26, 0x40, 0x06,       /* X LOGICAL_MAX (1600) */
     0x35, 0x00,
-    0x46, 0x72, 0x06,
+    0x46, 0x50, 0x05,       /* X PHYSICAL_MAX (1360) = 136mm */
     0x55, 0x0E,
     0x65, 0x11,
     0x75, 0x0C,
     0x95, 0x01,
     0x81, 0x02,
     0x09, 0x31,
-    0x26, 0x82, 0x04,
-    0x46, 0x4C, 0x04,
+    0x26, 0xB6, 0x03,       /* Y LOGICAL_MAX (950) */
+    0x46, 0x5C, 0x03,       /* Y PHYSICAL_MAX (860) = 86mm */
     0x81, 0x02,
     0xC0,
 
@@ -401,17 +617,17 @@ static const uint8_t zmk_hid_report_desc[] = {
     0x05, 0x01,
     0x09, 0x30,
     0x15, 0x00,
-    0x26, 0xFD, 0x09,
+    0x26, 0x40, 0x06,       /* X LOGICAL_MAX (1600) */
     0x35, 0x00,
-    0x46, 0x72, 0x06,
+    0x46, 0x50, 0x05,       /* X PHYSICAL_MAX (1360) = 136mm */
     0x55, 0x0E,
     0x65, 0x11,
     0x75, 0x0C,
     0x95, 0x01,
     0x81, 0x02,
     0x09, 0x31,
-    0x26, 0x82, 0x04,
-    0x46, 0x4C, 0x04,
+    0x26, 0xB6, 0x03,       /* Y LOGICAL_MAX (950) */
+    0x46, 0x5C, 0x03,       /* Y PHYSICAL_MAX (860) = 86mm */
     0x81, 0x02,
     0xC0,
 
@@ -434,23 +650,23 @@ static const uint8_t zmk_hid_report_desc[] = {
     0x05, 0x01,
     0x09, 0x30,
     0x15, 0x00,
-    0x26, 0xFD, 0x09,
+    0x26, 0x40, 0x06,       /* X LOGICAL_MAX (1600) */
     0x35, 0x00,
-    0x46, 0x72, 0x06,
+    0x46, 0x50, 0x05,       /* X PHYSICAL_MAX (1360) = 136mm */
     0x55, 0x0E,
     0x65, 0x11,
     0x75, 0x0C,
     0x95, 0x01,
     0x81, 0x02,
     0x09, 0x31,
-    0x26, 0x82, 0x04,
-    0x46, 0x4C, 0x04,
+    0x26, 0xB6, 0x03,       /* Y LOGICAL_MAX (950) */
+    0x46, 0x5C, 0x03,       /* Y PHYSICAL_MAX (860) = 86mm */
     0x81, 0x02,
     0xC0,
 
     0xC0,                   /* END_COLLECTION (Application) */
-#endif // IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT)
 };
+#endif // CONFIG_ZMK_USB_HID_TRACKPAD_INTERFACE
 
 #if IS_ENABLED(CONFIG_ZMK_USB_BOOT)
 
@@ -542,7 +758,7 @@ struct zmk_hid_mouse_resolution_feature_report {
 
 #endif // IS_ENABLED(CONFIG_ZMK_POINTING)
 
-#if IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT)
+#if IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT) || IS_ENABLED(CONFIG_ZMK_HOGP_ITRACK_OUTPUT)
 
 /* Maximum fingers supported in ADG trackpad report */
 #define ZMK_HID_TRACKPAD_MAX_FINGERS 5
@@ -550,7 +766,7 @@ struct zmk_hid_mouse_resolution_feature_report {
 /*
  * ADG Finger Data (4 bytes packed)
  *
- * Bit layout:
+ * Bit layout (matches USB HID descriptor):
  *   Byte 0: Tip Switch (1) | Confidence (1) | Transducer Index (6)
  *   Byte 1: X[7:0]
  *   Byte 2: X[11:8] (low nibble) | Y[3:0] (high nibble)
@@ -616,7 +832,7 @@ static inline void zmk_hid_trackpad_finger_clear(struct zmk_hid_trackpad_finger 
     f->y_high = 0;
 }
 
-#endif // IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT)
+#endif // IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT) || IS_ENABLED(CONFIG_ZMK_HOGP_ITRACK_OUTPUT)
 
 zmk_mod_flags_t zmk_hid_get_explicit_mods(void);
 int zmk_hid_register_mod(zmk_mod_t modifier);
@@ -668,7 +884,7 @@ zmk_hid_boot_report_t *zmk_hid_get_boot_report();
 struct zmk_hid_mouse_report *zmk_hid_get_mouse_report();
 #endif // IS_ENABLED(CONFIG_ZMK_POINTING)
 
-#if IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT)
+#if IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT) || IS_ENABLED(CONFIG_ZMK_HOGP_ITRACK_OUTPUT)
 struct zmk_hid_trackpad_report *zmk_hid_get_trackpad_report(void);
 void zmk_hid_trackpad_clear(void);
-#endif // IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT)
+#endif // IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT) || IS_ENABLED(CONFIG_ZMK_HOGP_ITRACK_OUTPUT)
