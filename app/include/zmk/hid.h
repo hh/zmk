@@ -76,7 +76,7 @@
 #define ZMK_HID_REPORT_ID_LEDS 0x01
 #define ZMK_HID_REPORT_ID_CONSUMER 0x02
 #define ZMK_HID_REPORT_ID_MOUSE 0x03
-#define ZMK_HID_REPORT_ID_TRACKPAD 0x04
+#define ZMK_HID_REPORT_ID_TRACKPAD 0x20  /* Apple ADG uses 0x20 for trackpad */
 
 #ifndef HID_ITEM_TAG_PUSH
 #define HID_ITEM_TAG_PUSH 0xA
@@ -259,11 +259,21 @@ static const uint8_t zmk_hid_report_desc[] = {
     /* ADG Chapter 15 Trackpad - Touch Pad Application
      * For USB with CONFIG_ZMK_USB_HID_TRACKPAD_INTERFACE: trackpad is on HID_1
      * For BLE: trackpad is included in this descriptor
+     * ADG-compliant: Report ID 0x20, Surface Switch feature, Physical collections
      */
     0x05, 0x0D,             /* USAGE_PAGE (Digitizers) */
     0x09, 0x05,             /* USAGE (Touch Pad) */
     0xA1, 0x01,             /* COLLECTION (Application) */
-    0x85, ZMK_HID_REPORT_ID_TRACKPAD, /* REPORT_ID (4) */
+    0x85, ZMK_HID_REPORT_ID_TRACKPAD, /* REPORT_ID (0x20) */
+
+    /* Surface Switch Feature - required by Apple ADG */
+    0x05, 0x0D,             /*   USAGE_PAGE (Digitizers) */
+    0x09, 0x57,             /*   USAGE (Surface Switch) */
+    0x75, 0x01,             /*   REPORT_SIZE (1) */
+    0x95, 0x01,             /*   REPORT_COUNT (1) */
+    0xB1, 0x02,             /*   FEATURE (Data,Var,Abs) */
+    0x95, 0x07,             /*   REPORT_COUNT (7) */
+    0xB1, 0x03,             /*   FEATURE (Const,Var,Abs) - padding */
 
     /* Scan Time (16-bit, 100us units) */
     0x05, 0x0D,             /*   USAGE_PAGE (Digitizers) */
@@ -289,7 +299,7 @@ static const uint8_t zmk_hid_report_desc[] = {
     /* Finger 0 */
     0x05, 0x0D,             /* USAGE_PAGE (Digitizers) */
     0x09, 0x22,             /* USAGE (Finger) */
-    0xA1, 0x02,             /* COLLECTION (Logical) */
+    0xA1, 0x00,             /* COLLECTION (Physical) - ADG-compliant */
     0x09, 0x42,             /*   USAGE (Tip Switch) */
     0x09, 0x47,             /*   USAGE (Confidence) */
     0x15, 0x00,             /*   LOGICAL_MINIMUM (0) */
@@ -322,7 +332,7 @@ static const uint8_t zmk_hid_report_desc[] = {
     /* Finger 1 */
     0x05, 0x0D,
     0x09, 0x22,
-    0xA1, 0x02,
+    0xA1, 0x00,             /* COLLECTION (Physical) */
     0x09, 0x42,
     0x09, 0x47,
     0x15, 0x00,
@@ -355,7 +365,7 @@ static const uint8_t zmk_hid_report_desc[] = {
     /* Finger 2 */
     0x05, 0x0D,
     0x09, 0x22,
-    0xA1, 0x02,
+    0xA1, 0x00,             /* COLLECTION (Physical) */
     0x09, 0x42,
     0x09, 0x47,
     0x15, 0x00,
@@ -388,7 +398,7 @@ static const uint8_t zmk_hid_report_desc[] = {
     /* Finger 3 */
     0x05, 0x0D,
     0x09, 0x22,
-    0xA1, 0x02,
+    0xA1, 0x00,             /* COLLECTION (Physical) */
     0x09, 0x42,
     0x09, 0x47,
     0x15, 0x00,
@@ -421,7 +431,7 @@ static const uint8_t zmk_hid_report_desc[] = {
     /* Finger 4 */
     0x05, 0x0D,
     0x09, 0x22,
-    0xA1, 0x02,
+    0xA1, 0x00,             /* COLLECTION (Physical) */
     0x09, 0x42,
     0x09, 0x47,
     0x15, 0x00,
@@ -472,11 +482,22 @@ static const uint8_t zmk_hid_report_desc[] = {
 #if IS_ENABLED(CONFIG_ZMK_USB_HID_TRACKPAD_INTERFACE) && \
     (IS_ENABLED(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT) || IS_ENABLED(CONFIG_ZMK_HOGP_ITRACK_OUTPUT))
 static const uint8_t zmk_hid_trackpad_desc[] = {
-    /* ADG Chapter 15 Trackpad - Touch Pad Application */
+    /* ADG Chapter 15 Trackpad - Touch Pad Application
+     * ADG-compliant: Report ID 0x20, Surface Switch feature, Physical collections
+     */
     0x05, 0x0D,             /* USAGE_PAGE (Digitizers) */
     0x09, 0x05,             /* USAGE (Touch Pad) */
     0xA1, 0x01,             /* COLLECTION (Application) */
-    0x85, ZMK_HID_REPORT_ID_TRACKPAD, /* REPORT_ID (4) */
+    0x85, ZMK_HID_REPORT_ID_TRACKPAD, /* REPORT_ID (0x20) */
+
+    /* Surface Switch Feature - required by Apple ADG */
+    0x05, 0x0D,             /*   USAGE_PAGE (Digitizers) */
+    0x09, 0x57,             /*   USAGE (Surface Switch) */
+    0x75, 0x01,             /*   REPORT_SIZE (1) */
+    0x95, 0x01,             /*   REPORT_COUNT (1) */
+    0xB1, 0x02,             /*   FEATURE (Data,Var,Abs) */
+    0x95, 0x07,             /*   REPORT_COUNT (7) */
+    0xB1, 0x03,             /*   FEATURE (Const,Var,Abs) - padding */
 
     /* Scan Time (16-bit, 100us units) */
     0x05, 0x0D,             /*   USAGE_PAGE (Digitizers) */
@@ -502,7 +523,7 @@ static const uint8_t zmk_hid_trackpad_desc[] = {
     /* Finger 0 */
     0x05, 0x0D,             /* USAGE_PAGE (Digitizers) */
     0x09, 0x22,             /* USAGE (Finger) */
-    0xA1, 0x02,             /* COLLECTION (Logical) */
+    0xA1, 0x00,             /* COLLECTION (Physical) - ADG-compliant */
     0x09, 0x42,             /*   USAGE (Tip Switch) */
     0x09, 0x47,             /*   USAGE (Confidence) */
     0x15, 0x00,             /*   LOGICAL_MINIMUM (0) */
@@ -535,7 +556,7 @@ static const uint8_t zmk_hid_trackpad_desc[] = {
     /* Finger 1 */
     0x05, 0x0D,
     0x09, 0x22,
-    0xA1, 0x02,
+    0xA1, 0x00,             /* COLLECTION (Physical) */
     0x09, 0x42,
     0x09, 0x47,
     0x15, 0x00,
@@ -568,7 +589,7 @@ static const uint8_t zmk_hid_trackpad_desc[] = {
     /* Finger 2 */
     0x05, 0x0D,
     0x09, 0x22,
-    0xA1, 0x02,
+    0xA1, 0x00,             /* COLLECTION (Physical) */
     0x09, 0x42,
     0x09, 0x47,
     0x15, 0x00,
@@ -601,7 +622,7 @@ static const uint8_t zmk_hid_trackpad_desc[] = {
     /* Finger 3 */
     0x05, 0x0D,
     0x09, 0x22,
-    0xA1, 0x02,
+    0xA1, 0x00,             /* COLLECTION (Physical) */
     0x09, 0x42,
     0x09, 0x47,
     0x15, 0x00,
@@ -634,7 +655,7 @@ static const uint8_t zmk_hid_trackpad_desc[] = {
     /* Finger 4 */
     0x05, 0x0D,
     0x09, 0x22,
-    0xA1, 0x02,
+    0xA1, 0x00,             /* COLLECTION (Physical) */
     0x09, 0x42,
     0x09, 0x47,
     0x15, 0x00,
