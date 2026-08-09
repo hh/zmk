@@ -247,8 +247,10 @@ static const struct led_rgb BT_COLORS[NUM_BT_COLORS] = {LED_RGB(0xFFFFFF), LED_R
 #define USB_INDICATOR_COLOR LED_RGB(0x00FFFF)
 
 #if IS_ENABLED(CONFIG_ZMK_INPUTSTICK)
-/* InputStick target: orange -- not used by any BT profile or by USB. */
-#define INPUTSTICK_INDICATOR_COLOR LED_RGB(0xFF6000)
+/* InputStick target: magenta. Orange was tried first and is unusable here --
+ * on this pixel it reads as red (BT_SEL 2) or yellow (BT_SEL 4). Magenta is
+ * the only hue left that no BT profile or USB already claims. */
+#define INPUTSTICK_INDICATOR_COLOR LED_RGB(0xFF00FF)
 #endif
 #endif
 
