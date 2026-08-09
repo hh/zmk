@@ -610,9 +610,21 @@ static void is_subscribe_cb(struct bt_conn *conn, uint8_t err,
      * never got its CCC written will never answer RUN_FW. */
     if (err) {
         LOG_ERR("CCC write failed (att err 0x%02x) -- notifications are NOT enabled", err);
-    } else {
-        LOG_INF("CCC written, notifications enabled");
+        if (istick.conn) {
+            bt_conn_disconnect(istick.conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+        }
+        return;
     }
+
+    LOG_INF("CCC written, notifications enabled");
+
+    /*
+     * Start the handshake HERE, not when bt_gatt_subscribe() returns. That
+     * return only means the request was queued; the CCC write landed ~300ms
+     * later. RUN_FW was going out into a connection that could not yet notify
+     * us, so any reply was dropped before we could see it.
+     */
+    k_sem_give(&handshake_sem);
 }
 
 static void is_subscribe(void) {
@@ -642,8 +654,8 @@ static void is_subscribe(void) {
         return;
     }
 
-    LOG_INF("subscribed to notify handle 0x%04x, starting handshake", istick.notify_handle);
-    k_sem_give(&handshake_sem);
+    LOG_INF("subscribe requested on handle 0x%04x, waiting for CCC to land",
+            istick.notify_handle);
 }
 
 static void is_discover_characteristics(void);
