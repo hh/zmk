@@ -104,7 +104,11 @@ target_sources_ifdef(CONFIG_ZMK_USB app PRIVATE src/usb_hid.c)
 target_sources_ifdef(CONFIG_ZMK_RGB_UNDERGLOW app PRIVATE src/rgb_underglow.c)
 target_sources_ifdef(CONFIG_ZMK_BACKLIGHT app PRIVATE src/backlight.c)
 target_sources_ifdef(CONFIG_ZMK_LOW_PRIORITY_WORK_QUEUE app PRIVATE src/workqueue.c)
-add_subdirectory_ifdef(CONFIG_ZMK_HOGP src/hogp/)
+# The InputStick client lives alongside HOGP and shares its BLE-central
+# plumbing, but does not require it -- build the directory for either.
+if(CONFIG_ZMK_HOGP OR CONFIG_ZMK_INPUTSTICK)
+  add_subdirectory(src/hogp/)
+endif()
 target_sources(app PRIVATE src/main.c)
 
 add_subdirectory(src/display/)

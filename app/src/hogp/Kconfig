@@ -79,6 +79,46 @@ source "subsys/logging/Kconfig.template.log_config"
 
 endif # ZMK_HOGP
 
+menuconfig ZMK_INPUTSTICK
+    bool "InputStick client (drive a USB HID dongle over BLE)"
+    depends on BT_CENTRAL
+    select BT_GATT_CLIENT
+    select BT_GATT_AUTO_DISCOVER_CCC
+    select CRC
+    help
+      Act as a BLE central to an InputStick USB HID dongle, which presents
+      itself to whatever machine it is plugged into as a plain USB keyboard
+      and mouse. This lets the keyboard type into a host it has never paired
+      with -- useful for machines that cannot accept a BLE keyboard at all
+      (BIOS screens, KVMs, locked-down desktops).
+
+      Unlike HOGP this is not a HID connection: the dongle speaks a framed
+      binary protocol over Nordic UART Service, and needs no bonding, so it
+      costs no BT_MAX_PAIRED slot.
+
+if ZMK_INPUTSTICK
+
+config ZMK_INPUTSTICK_THREAD_STACK_SIZE
+    int "InputStick handshake thread stack size"
+    default 2048
+    help
+      The handshake blocks on GATT writes and notification replies, so it
+      cannot run on the BT RX thread or a workqueue and needs its own.
+
+config ZMK_INPUTSTICK_TYPE_DELAY_MS
+    int "Delay between characters when typing a string"
+    default 20
+    help
+      Pause after each character sent by inputstick_type(). Too short and
+      the dongle's USB side coalesces or drops repeats; 20ms matches the
+      hardware-verified prototypes.
+
+module = ZMK_INPUTSTICK
+module-str = zmk_inputstick
+source "subsys/logging/Kconfig.template.log_config"
+
+endif # ZMK_INPUTSTICK
+
 menuconfig ZMK_SERIAL_CMD
     bool "Serial command handler for USB logging console"
     depends on ZMK_USB_LOGGING

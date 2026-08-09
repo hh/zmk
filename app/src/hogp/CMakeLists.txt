@@ -19,7 +19,8 @@ add_custom_target(zmk_build_version DEPENDS ${VERSION_HEADER})
 target_include_directories(app PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 add_dependencies(app zmk_build_version)
 
-target_sources(app PRIVATE hogp_central.c)
+target_sources_ifdef(CONFIG_ZMK_HOGP app PRIVATE hogp_central.c)
+target_sources_ifdef(CONFIG_ZMK_INPUTSTICK app PRIVATE inputstick.c)
 
 target_sources_ifdef(CONFIG_ZMK_HOGP_MOUSE_OUTPUT app PRIVATE hogp_mouse.c)
 target_sources_ifdef(CONFIG_ZMK_HOGP_TRACKPAD_OUTPUT app PRIVATE hogp_trackpad.c)

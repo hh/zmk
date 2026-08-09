@@ -46,6 +46,10 @@
 #include <zmk/hogp/hogp.h>
 #endif
 
+#if IS_ENABLED(CONFIG_ZMK_INPUTSTICK)
+#include <zmk/hogp/inputstick.h>
+#endif
+
 LOG_MODULE_REGISTER(serial_cmd, CONFIG_ZMK_SERIAL_CMD_LOG_LEVEL);
 
 #if DT_HAS_CHOSEN(zephyr_console)
@@ -153,6 +157,30 @@ static void process_command(const char *cmd) {
         hogp_dump_nvs_state();
 #endif /* CONFIG_ZMK_HOGP */
 
+#if IS_ENABLED(CONFIG_ZMK_INPUTSTICK)
+    } else if (strncmp(cmd, "istick", 6) == 0) {
+        LOG_INF("Scanning for InputStick dongle...");
+        inputstick_start();
+
+    } else if (strncmp(cmd, "istop", 5) == 0) {
+        inputstick_stop();
+
+    } else if (strncmp(cmd, "istatus", 7) == 0) {
+        inputstick_print_status();
+
+    } else if (strncmp(cmd, "itype", 5) == 0) {
+        /*
+         * Fixed string: the command parser only collects [a-z], so there is no
+         * way to pass arbitrary text over the console. Deliberately includes
+         * shifted and symbol characters to exercise the whole keycode table.
+         */
+        LOG_INF("Typing test string on the dongle...");
+        int err = inputstick_type("Hello from Adv360! 0123 (test) key=value\n");
+        if (err) {
+            LOG_ERR("Type failed (err %d)", err);
+        }
+#endif /* CONFIG_ZMK_INPUTSTICK */
+
     } else if (strncmp(cmd, "profiles", 8) == 0 || strncmp(cmd, "prof", 4) == 0) {
         /* Show BLE profile status */
         LOG_INF("=== BLE Profiles ===");
@@ -188,6 +216,9 @@ static void process_command(const char *cmd) {
         LOG_INF("Commands: !reboot, !boot, !ble, !usb, !forget, !prof, !debug, !nodebug, !version"
 #if IS_ENABLED(CONFIG_ZMK_HOGP)
                 ", !pair, !unpair, !hogp, !clear, !clearhosts"
+#endif
+#if IS_ENABLED(CONFIG_ZMK_INPUTSTICK)
+                ", !istick, !istop, !istatus, !itype"
 #endif
                 ", !help");
 
