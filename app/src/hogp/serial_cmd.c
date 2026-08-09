@@ -206,17 +206,24 @@ static void process_command(const char *cmd) {
 
     } else if (strncmp(cmd, "version", 7) == 0 || strncmp(cmd, "ver", 3) == 0) {
         /*
-         * Both repos, always. The config repo alone names a commit that may
-         * contain none of the firmware code that is actually running -- HOGP
-         * and the InputStick client live in the zmk tree.
+         * printk, not LOG_INF. This module compiles at CONFIG_LOG_DEFAULT_LEVEL
+         * (WARNING in the production conf), so every LOG_INF here is stripped at
+         * build time -- !version ran and printed absolutely nothing, which is a
+         * spectacular failure mode for the one command whose entire job is to
+         * report information. printk bypasses log filtering entirely; the BT
+         * profile broadcast below already relies on it for the same reason.
+         *
+         * Both repos, always: the config repo alone names a commit that may
+         * contain none of the running firmware code -- HOGP and the InputStick
+         * client live in the zmk tree.
          */
-        LOG_INF("=== Build Info ===");
-        LOG_INF("Version: %s", ZMK_BUILD_VERSION);
-        LOG_INF("Config:  %s @ %s", ZMK_BUILD_BRANCH, ZMK_BUILD_COMMIT);
-        LOG_INF("ZMK:     %s @ %s", ZMK_BUILD_ZMK_BRANCH, ZMK_BUILD_ZMK_COMMIT);
-        LOG_INF("Name:    %s", CONFIG_ZMK_KEYBOARD_NAME);
-        LOG_INF("Built:   %s UTC", ZMK_BUILD_TIME);
-        LOG_INF("==================");
+        printk("=== Build Info ===\n");
+        printk("Version: %s\n", ZMK_BUILD_VERSION);
+        printk("Config:  %s @ %s\n", ZMK_BUILD_BRANCH, ZMK_BUILD_COMMIT);
+        printk("ZMK:     %s @ %s\n", ZMK_BUILD_ZMK_BRANCH, ZMK_BUILD_ZMK_COMMIT);
+        printk("Name:    %s\n", CONFIG_ZMK_KEYBOARD_NAME);
+        printk("Built:   %s UTC\n", ZMK_BUILD_TIME);
+        printk("==================\n");
 
     } else if (strncmp(cmd, "help", 4) == 0) {
         LOG_INF("Commands: !reboot, !boot, !ble, !usb, !forget, !prof, !debug, !nodebug, !version"

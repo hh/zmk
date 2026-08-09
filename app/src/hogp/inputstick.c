@@ -764,19 +764,24 @@ void inputstick_print_status(void) {
     static const char *names[] = {"IDLE", "SCANNING", "CONNECTING", "DISCOVERING", "HANDSHAKING",
                                   "READY"};
 
-    LOG_INF("=== InputStick ===");
-    LOG_INF("State: %s", names[istick.state]);
+    /*
+     * printk, not LOG_INF: status output must survive whatever the module log
+     * level happens to be. !version was silently a no-op for exactly this
+     * reason -- see the note in serial_cmd.c.
+     */
+    printk("=== InputStick ===\n");
+    printk("State: %s\n", names[istick.state]);
     if (istick.conn) {
         char addr_str[BT_ADDR_LE_STR_LEN];
         bt_addr_le_to_str(&istick.addr, addr_str, sizeof(addr_str));
-        LOG_INF("Dongle: %s (%s)", addr_str, istick.legacy_hm ? "HM-10" : "NUS");
-        LOG_INF("Handles: write=0x%04x notify=0x%04x", istick.write_handle, istick.notify_handle);
-        LOG_INF("Firmware: %d  HID status seen: %s", istick.fw_version,
-                istick.got_status ? "yes" : "no");
+        printk("Dongle: %s (%s)\n", addr_str, istick.legacy_hm ? "HM-10" : "NUS");
+        printk("Handles: write=0x%04x notify=0x%04x\n", istick.write_handle, istick.notify_handle);
+        printk("Firmware: %d  HID status seen: %s\n", istick.fw_version,
+               istick.got_status ? "yes" : "no");
     } else {
-        LOG_INF("Dongle: (not connected)");
+        printk("Dongle: (not connected)\n");
     }
-    LOG_INF("==================");
+    printk("==================\n");
 }
 
 int inputstick_send_keys(uint8_t modifier, const uint8_t *keycodes, size_t count) {
