@@ -205,10 +205,16 @@ static void process_command(const char *cmd) {
         LOG_INF("Debug logging DISABLED");
 
     } else if (strncmp(cmd, "version", 7) == 0 || strncmp(cmd, "ver", 3) == 0) {
+        /*
+         * Both repos, always. The config repo alone names a commit that may
+         * contain none of the firmware code that is actually running -- HOGP
+         * and the InputStick client live in the zmk tree.
+         */
         LOG_INF("=== Build Info ===");
         LOG_INF("Version: %s", ZMK_BUILD_VERSION);
-        LOG_INF("Commit:  %s", ZMK_BUILD_COMMIT);
-        LOG_INF("Branch:  %s", ZMK_BUILD_BRANCH);
+        LOG_INF("Config:  %s @ %s", ZMK_BUILD_BRANCH, ZMK_BUILD_COMMIT);
+        LOG_INF("ZMK:     %s @ %s", ZMK_BUILD_ZMK_BRANCH, ZMK_BUILD_ZMK_COMMIT);
+        LOG_INF("Name:    %s", CONFIG_ZMK_KEYBOARD_NAME);
         LOG_INF("Built:   %s UTC", ZMK_BUILD_TIME);
         LOG_INF("==================");
 
