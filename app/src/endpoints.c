@@ -19,6 +19,9 @@
 #include <zmk/events/ble_active_profile_changed.h>
 #include <zmk/events/usb_conn_state_changed.h>
 #include <zmk/events/endpoint_changed.h>
+#if IS_ENABLED(CONFIG_ZMK_INPUTSTICK)
+#include <zmk/hogp/inputstick.h>
+#endif
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
@@ -59,6 +62,11 @@ bool zmk_endpoint_instance_eq(struct zmk_endpoint_instance a, struct zmk_endpoin
 
     case ZMK_TRANSPORT_BLE:
         return a.ble.profile_index == b.ble.profile_index;
+
+#if IS_ENABLED(CONFIG_ZMK_INPUTSTICK)
+    case ZMK_TRANSPORT_INPUTSTICK:
+        return a.inputstick.slot == b.inputstick.slot;
+#endif
     }
 
     LOG_ERR("Invalid transport %d", a.transport);
@@ -73,6 +81,11 @@ int zmk_endpoint_instance_to_str(struct zmk_endpoint_instance endpoint, char *st
     case ZMK_TRANSPORT_BLE:
         return snprintf(str, len, "BLE:%d", endpoint.ble.profile_index);
 
+#if IS_ENABLED(CONFIG_ZMK_INPUTSTICK)
+    case ZMK_TRANSPORT_INPUTSTICK:
+        return snprintf(str, len, "STICK:%d", endpoint.inputstick.slot);
+#endif
+
     default:
         return snprintf(str, len, "Invalid");
     }
@@ -80,6 +93,7 @@ int zmk_endpoint_instance_to_str(struct zmk_endpoint_instance endpoint, char *st
 
 #define INSTANCE_INDEX_OFFSET_USB 0
 #define INSTANCE_INDEX_OFFSET_BLE ZMK_ENDPOINT_USB_COUNT
+#define INSTANCE_INDEX_OFFSET_INPUTSTICK (ZMK_ENDPOINT_USB_COUNT + ZMK_ENDPOINT_BLE_COUNT)
 
 int zmk_endpoint_instance_to_index(struct zmk_endpoint_instance endpoint) {
     switch (endpoint.transport) {
@@ -88,6 +102,11 @@ int zmk_endpoint_instance_to_index(struct zmk_endpoint_instance endpoint) {
 
     case ZMK_TRANSPORT_BLE:
         return INSTANCE_INDEX_OFFSET_BLE + endpoint.ble.profile_index;
+
+#if IS_ENABLED(CONFIG_ZMK_INPUTSTICK)
+    case ZMK_TRANSPORT_INPUTSTICK:
+        return INSTANCE_INDEX_OFFSET_INPUTSTICK + endpoint.inputstick.slot;
+#endif
     }
 
     LOG_ERR("Invalid transport %d", endpoint.transport);
@@ -148,6 +167,18 @@ static int send_keyboard_report(void) {
         return -ENOTSUP;
 #endif /* IS_ENABLED(CONFIG_ZMK_BLE) */
     }
+
+#if IS_ENABLED(CONFIG_ZMK_INPUTSTICK)
+    case ZMK_TRANSPORT_INPUTSTICK: {
+        /* The dongle speaks the 8-byte USB boot keyboard report, which is
+         * exactly what HKRO produces: modifier byte, reserved, then up to 6
+         * keycodes. Pass the body straight through. NKRO builds use a bitmap
+         * instead and cannot be forwarded without translation. */
+        struct zmk_hid_keyboard_report *keyboard_report = zmk_hid_get_keyboard_report();
+        return inputstick_send_keys(keyboard_report->body.modifiers, keyboard_report->body.keys,
+                                    sizeof(keyboard_report->body.keys));
+    }
+#endif
     }
 
     LOG_ERR("Unhandled endpoint transport %d", current_instance.transport);
@@ -182,6 +213,14 @@ static int send_consumer_report(void) {
         return -ENOTSUP;
 #endif /* IS_ENABLED(CONFIG_ZMK_BLE) */
     }
+
+#if IS_ENABLED(CONFIG_ZMK_INPUTSTICK)
+    case ZMK_TRANSPORT_INPUTSTICK:
+        /* HID_DATA_CONSUMER (0x22) exists in the protocol and the dongle
+         * exposes a Consumer Control interface, but it is not implemented
+         * yet -- media keys silently do nothing on this transport. */
+        return -ENOTSUP;
+#endif
     }
 
     LOG_ERR("Unhandled endpoint transport %d", current_instance.transport);
@@ -232,6 +271,14 @@ int zmk_endpoints_send_mouse_report() {
         return -ENOTSUP;
 #endif /* IS_ENABLED(CONFIG_ZMK_BLE) */
     }
+
+#if IS_ENABLED(CONFIG_ZMK_INPUTSTICK)
+    case ZMK_TRANSPORT_INPUTSTICK: {
+        struct zmk_hid_mouse_report *mouse_report = zmk_hid_get_mouse_report();
+        return inputstick_send_mouse(mouse_report->body.buttons, mouse_report->body.d_x,
+                                     mouse_report->body.d_y, mouse_report->body.d_scroll_y);
+    }
+#endif
     }
 
     LOG_ERR("Unhandled endpoint transport %d", current_instance.transport);
@@ -319,7 +366,24 @@ static bool is_ble_ready(void) {
 #endif
 }
 
+#if IS_ENABLED(CONFIG_ZMK_INPUTSTICK)
+static bool is_inputstick_ready(void) { return inputstick_is_ready(); }
+#endif
+
 static enum zmk_transport get_selected_transport(void) {
+#if IS_ENABLED(CONFIG_ZMK_INPUTSTICK)
+    /* An explicitly chosen dongle wins over USB/BLE readiness -- the whole
+     * point of picking a target is that it stays picked. If the dongle is not
+     * connected yet we deliberately fall through to USB/BLE so the keyboard
+     * keeps typing somewhere useful; the status LED fast-blinks meanwhile. */
+    if (preferred_transport == ZMK_TRANSPORT_INPUTSTICK) {
+        if (is_inputstick_ready()) {
+            return ZMK_TRANSPORT_INPUTSTICK;
+        }
+        LOG_DBG("InputStick preferred but not ready, falling back");
+    }
+#endif
+
     if (is_ble_ready()) {
         if (is_usb_ready()) {
             LOG_DBG("Both endpoint transports are ready. Using %d", preferred_transport);
@@ -348,6 +412,12 @@ static struct zmk_endpoint_instance get_selected_instance(void) {
         instance.ble.profile_index = zmk_ble_active_profile_index();
         break;
 #endif // IS_ENABLED(CONFIG_ZMK_BLE)
+
+#if IS_ENABLED(CONFIG_ZMK_INPUTSTICK)
+    case ZMK_TRANSPORT_INPUTSTICK:
+        instance.inputstick.slot = inputstick_active_slot();
+        break;
+#endif
 
     default:
         // No extra data for this transport.

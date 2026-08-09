@@ -20,6 +20,27 @@
 /* Begin scanning for a dongle advertising as "InputStick*" and connect. */
 void inputstick_start(void);
 
+/*
+ * Target slots. Each slot remembers ONE dongle by BLE address, so selecting a
+ * slot always reaches the same machine instead of whichever dongle answers
+ * first. A slot with no address is "open": the next dongle found while it is
+ * selected gets bound to it -- the same model as ZMK's BLE profiles, minus the
+ * bond (an InputStick needs no pairing, so it costs no BT_MAX_PAIRED slot).
+ */
+
+/* Select a slot and begin connecting to it. Binds on first sighting if open. */
+int inputstick_select_slot(uint8_t slot);
+
+/* Forget the dongle bound to a slot; it becomes open again. */
+int inputstick_clear_slot(uint8_t slot);
+
+/* The slot currently selected for output. */
+uint8_t inputstick_active_slot(void);
+
+/* True if the slot has a dongle address stored. Drives the status LED: an
+ * open slot fast-blinks the way an unpaired BLE profile does. */
+bool inputstick_slot_is_bound(uint8_t slot);
+
 /* Disconnect and stop scanning. */
 void inputstick_stop(void);
 

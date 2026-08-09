@@ -31,6 +31,9 @@
 #include <zmk/keymap.h>
 #include <zmk/ble.h>
 #include <zmk/endpoints.h>
+#if IS_ENABLED(CONFIG_ZMK_INPUTSTICK)
+#include <zmk/hogp/inputstick.h>
+#endif
 #include <zmk/hogp/hogp.h>
 
 #if ZMK_BLE_IS_CENTRAL
@@ -242,6 +245,11 @@ static const struct led_rgb BT_COLORS[NUM_BT_COLORS] = {LED_RGB(0xFFFFFF), LED_R
 
 /* USB indicator: cyan (distinct from all BT profile colors) */
 #define USB_INDICATOR_COLOR LED_RGB(0x00FFFF)
+
+#if IS_ENABLED(CONFIG_ZMK_INPUTSTICK)
+/* InputStick target: orange -- not used by any BT profile or by USB. */
+#define INPUTSTICK_INDICATOR_COLOR LED_RGB(0xFF6000)
+#endif
 #endif
 
 static const struct led_rgb LAYER_COLORS[8] = {
@@ -353,7 +361,28 @@ static void zmk_rgb_underglow_effect_kinesis() {
     // USB: solid cyan, BT: profile color (blinking if not paired/connected)
     // Show what transport is ACTUALLY being used for output
     struct zmk_endpoint_instance endpoint = zmk_endpoints_selected();
+#if IS_ENABLED(CONFIG_ZMK_INPUTSTICK)
+    /*
+     * Deliberately keyed off the PREFERRED transport, not the selected one.
+     * When a dongle is chosen but not connected yet, endpoints falls back to
+     * USB/BLE so the keyboard still types somewhere -- but the indicator must
+     * keep showing the target the user asked for, blinking, rather than
+     * quietly claiming they are on Bluetooth.
+     *
+     * blink_step(0, 2) is the exact fast blink an unpaired BLE profile uses,
+     * so an unbound dongle slot looks the same as an open profile.
+     */
+    if (zmk_endpoints_preferred_transport() == ZMK_TRANSPORT_INPUTSTICK) {
+        if (inputstick_is_ready()) {
+            pixels[1] = INPUTSTICK_INDICATOR_COLOR;
+        } else {
+            bt_blinking = zmk_kinesis_blink_step(0, 2);
+            pixels[1] = bt_blinking ? LED_RGB(0x000000) : INPUTSTICK_INDICATOR_COLOR;
+        }
+    } else if (endpoint.transport == ZMK_TRANSPORT_USB) {
+#else
     if (endpoint.transport == ZMK_TRANSPORT_USB) {
+#endif
         pixels[1] = USB_INDICATOR_COLOR;
     } else {
         int bt_idx = zmk_ble_active_profile_index();

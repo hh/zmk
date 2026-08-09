@@ -1,0 +1,20 @@
+/*
+ * Copyright (c) 2024 The ZMK Contributors
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
+#include <dt-bindings/zmk/behaviors.h>
+
+/ {
+    behaviors {
+#if ZMK_BEHAVIOR_OMIT(IS)
+        /omit-if-no-ref/
+#endif
+        is: inputstick {
+            compatible = "zmk,behavior-inputstick";
+            #binding-cells = <2>;
+            display-name = "InputStick Target";
+        };
+    };
+};

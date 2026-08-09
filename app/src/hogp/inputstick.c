@@ -34,6 +34,7 @@
 
 #include <zephyr/init.h>
 #include <zephyr/kernel.h>
+#include <zephyr/settings/settings.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/crc.h>
@@ -129,6 +130,49 @@ static struct {
 } istick;
 
 static bool scan_running;
+
+/* ── target slots ─────────────────────────────────────────────────────────── */
+
+struct is_slot {
+    bt_addr_le_t addr;
+    bool bound;
+};
+
+static struct is_slot slots[CONFIG_ZMK_INPUTSTICK_SLOT_COUNT];
+static uint8_t active_slot;
+
+static void is_slot_save(uint8_t slot) {
+    char key[32];
+    snprintk(key, sizeof(key), "inputstick/slot_%u", slot);
+    if (slots[slot].bound) {
+        settings_save_one(key, &slots[slot].addr, sizeof(slots[slot].addr));
+    } else {
+        settings_delete(key);
+    }
+}
+
+static int is_settings_set(const char *name, size_t len, settings_read_cb read_cb, void *cb_arg) {
+    if (strncmp(name, "slot_", 5) == 0) {
+        unsigned long slot = strtoul(name + 5, NULL, 10);
+        if (slot >= CONFIG_ZMK_INPUTSTICK_SLOT_COUNT || len != sizeof(bt_addr_le_t)) {
+            return -EINVAL;
+        }
+        if (read_cb(cb_arg, &slots[slot].addr, sizeof(bt_addr_le_t)) > 0) {
+            slots[slot].bound = true;
+            LOG_INF("slot %lu restored from settings", slot);
+        }
+        return 0;
+    }
+    return -ENOENT;
+}
+
+SETTINGS_STATIC_HANDLER_DEFINE(inputstick, "inputstick", NULL, is_settings_set, NULL, NULL);
+
+uint8_t inputstick_active_slot(void) { return active_slot; }
+
+bool inputstick_slot_is_bound(uint8_t slot) {
+    return slot < CONFIG_ZMK_INPUTSTICK_SLOT_COUNT && slots[slot].bound;
+}
 
 static K_SEM_DEFINE(write_done_sem, 0, 1);
 static K_SEM_DEFINE(resp_sem, 0, 1);
@@ -643,7 +687,26 @@ static void is_scan_recv(const struct bt_le_scan_recv_info *info, struct net_buf
 
     char addr_str[BT_ADDR_LE_STR_LEN];
     bt_addr_le_to_str(info->addr, addr_str, sizeof(addr_str));
-    LOG_INF("found InputStick dongle at %s (rssi %d)", addr_str, info->rssi);
+
+    /*
+     * A bound slot only ever talks to ITS dongle. Without this, selecting a
+     * target would reach whichever dongle happened to answer first -- which
+     * defeats the point of having per-machine targets, and would silently type
+     * into the wrong computer.
+     */
+    if (slots[active_slot].bound) {
+        if (bt_addr_le_cmp(&slots[active_slot].addr, info->addr) != 0) {
+            LOG_DBG("ignoring %s, slot %u is bound elsewhere", addr_str, active_slot);
+            return;
+        }
+        LOG_INF("found bound dongle for slot %u at %s (rssi %d)", active_slot, addr_str,
+                info->rssi);
+    } else {
+        LOG_INF("binding slot %u to %s (rssi %d)", active_slot, addr_str, info->rssi);
+        bt_addr_le_copy(&slots[active_slot].addr, info->addr);
+        slots[active_slot].bound = true;
+        is_slot_save(active_slot);
+    }
 
     bt_addr_le_copy(&istick.addr, info->addr);
     istick.state = IS_STATE_CONNECTING;
@@ -742,6 +805,45 @@ void inputstick_start(void) {
 
     scan_running = true;
     LOG_INF("scanning for InputStick dongles...");
+}
+
+int inputstick_select_slot(uint8_t slot) {
+    if (slot >= CONFIG_ZMK_INPUTSTICK_SLOT_COUNT) {
+        LOG_ERR("slot %u out of range (max %d)", slot, CONFIG_ZMK_INPUTSTICK_SLOT_COUNT - 1);
+        return -EINVAL;
+    }
+
+    if (slot != active_slot && istick.conn) {
+        /* Different target: drop the current dongle before chasing the new one. */
+        LOG_INF("switching slot %u -> %u, disconnecting current dongle", active_slot, slot);
+        bt_conn_disconnect(istick.conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+    }
+
+    active_slot = slot;
+    LOG_INF("slot %u selected (%s)", slot, slots[slot].bound ? "bound" : "OPEN - will bind");
+
+    if (!inputstick_is_ready()) {
+        inputstick_start();
+    }
+    return 0;
+}
+
+int inputstick_clear_slot(uint8_t slot) {
+    if (slot >= CONFIG_ZMK_INPUTSTICK_SLOT_COUNT) {
+        return -EINVAL;
+    }
+
+    LOG_INF("clearing slot %u", slot);
+    slots[slot].bound = false;
+    memset(&slots[slot].addr, 0, sizeof(slots[slot].addr));
+    is_slot_save(slot);
+
+    /* If we are connected on the slot being cleared, drop it so the next scan
+     * can bind something new rather than silently keeping the old dongle. */
+    if (slot == active_slot && istick.conn) {
+        bt_conn_disconnect(istick.conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+    }
+    return 0;
 }
 
 void inputstick_stop(void) {

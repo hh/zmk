@@ -33,7 +33,14 @@
  * Note that this value may change between firmware versions, so it should not
  * be used in any persistent storage.
  */
-#define ZMK_ENDPOINT_COUNT (ZMK_ENDPOINT_USB_COUNT + ZMK_ENDPOINT_BLE_COUNT)
+#ifdef CONFIG_ZMK_INPUTSTICK
+#define ZMK_ENDPOINT_INPUTSTICK_COUNT CONFIG_ZMK_INPUTSTICK_SLOT_COUNT
+#else
+#define ZMK_ENDPOINT_INPUTSTICK_COUNT 0
+#endif
+
+#define ZMK_ENDPOINT_COUNT                                                                         \
+    (ZMK_ENDPOINT_USB_COUNT + ZMK_ENDPOINT_BLE_COUNT + ZMK_ENDPOINT_INPUTSTICK_COUNT)
 
 bool zmk_endpoint_instance_eq(struct zmk_endpoint_instance a, struct zmk_endpoint_instance b);
 

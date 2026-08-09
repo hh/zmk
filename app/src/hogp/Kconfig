@@ -98,6 +98,18 @@ menuconfig ZMK_INPUTSTICK
 
 if ZMK_INPUTSTICK
 
+config ZMK_INPUTSTICK_SLOT_COUNT
+    int "Number of InputStick target slots"
+    default 1
+    range 1 5
+    help
+      How many dongles can be remembered as separate output targets, each
+      selectable like a BLE profile. A slot stores one dongle's BLE address
+      so selecting it always reaches the same machine.
+
+      These are NOT bonds -- an InputStick needs no pairing -- so unlike BLE
+      profiles they cost nothing from CONFIG_BT_MAX_PAIRED.
+
 config ZMK_INPUTSTICK_THREAD_STACK_SIZE
     int "InputStick handshake thread stack size"
     default 2048
