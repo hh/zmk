@@ -16,11 +16,15 @@
  *   !hogp    - Show HOGP status
  *   !clear   - Clear HOGP device bonds (preserves host bonds)
  *   !clearhosts - Clear host bonds (preserves HOGP bonds)
+ *   !version - Show build version info
  *   !help    - Show available commands
  *
  * Also broadcasts BT profile changes for external bridge sync:
  *   Output: "BT:X" where X is profile index (0-4)
  */
+
+/* Build version - generated at compile time */
+#include "zmk_build_version.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
@@ -172,8 +176,16 @@ static void process_command(const char *cmd) {
         zmk_debug_enabled = false;
         LOG_INF("Debug logging DISABLED");
 
+    } else if (strncmp(cmd, "version", 7) == 0 || strncmp(cmd, "ver", 3) == 0) {
+        LOG_INF("=== Build Info ===");
+        LOG_INF("Version: %s", ZMK_BUILD_VERSION);
+        LOG_INF("Commit:  %s", ZMK_BUILD_COMMIT);
+        LOG_INF("Branch:  %s", ZMK_BUILD_BRANCH);
+        LOG_INF("Built:   %s UTC", ZMK_BUILD_TIME);
+        LOG_INF("==================");
+
     } else if (strncmp(cmd, "help", 4) == 0) {
-        LOG_INF("Commands: !reboot, !boot, !ble, !usb, !forget, !prof, !debug, !nodebug"
+        LOG_INF("Commands: !reboot, !boot, !ble, !usb, !forget, !prof, !debug, !nodebug, !version"
 #if IS_ENABLED(CONFIG_ZMK_HOGP)
                 ", !pair, !unpair, !hogp, !clear, !clearhosts"
 #endif
@@ -192,7 +204,9 @@ static void serial_cmd_thread(void *p1, void *p2, void *p3) {
         return;
     }
 
-    LOG_INF("Serial command handler ready. Use !command (e.g., !boot, !reboot, !help)");
+    LOG_INF("=== ZMK HOGP Build: %s ===", ZMK_BUILD_VERSION);
+    LOG_INF("Built: %s UTC", ZMK_BUILD_TIME);
+    LOG_INF("Serial command handler ready. Use !command (e.g., !boot, !version, !help)");
 
     while (1) {
         uint8_t c;

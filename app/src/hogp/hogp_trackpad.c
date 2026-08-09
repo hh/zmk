@@ -19,6 +19,9 @@
 #include <zmk/hog.h>
 #include <zmk/endpoints.h>
 
+/* External iTrack handler for 23-byte reports */
+extern void hogp_itrack_process(const uint8_t *data, uint16_t len);
+
 LOG_MODULE_REGISTER(hogp_trackpad, CONFIG_ZMK_HOGP_LOG_LEVEL);
 
 /*
@@ -75,8 +78,14 @@ static void parse_protoarc_finger(const uint8_t *data,
  */
 static void hogp_trackpad_process_report(const uint8_t *data, uint16_t len)
 {
+    /* Route 23-byte iTrack reports to the iTrack handler */
+    if (len == 23) {
+        hogp_itrack_process(data, len);
+        return;
+    }
+
     if (len != PROTOARC_REPORT_LEN) {
-        LOG_DBG("Unexpected report length: %d (expected %d)", len, PROTOARC_REPORT_LEN);
+        LOG_DBG("Unexpected report length: %d (expected %d or 23)", len, PROTOARC_REPORT_LEN);
         return;
     }
 
