@@ -113,6 +113,11 @@ static struct {
     uint16_t service_end_handle;
     uint16_t write_handle;
     uint16_t notify_handle;
+    /* Some dongles expose the NUS RX characteristic as write-without-response
+     * only. The Python reference always writes unacked; the JS prefers acked
+     * where supported because unacked writes can drop silently. Accept either
+     * and pick per characteristic rather than refusing the device outright. */
+    bool write_acked;
 
     uint16_t fw_version;
     bool got_status;
@@ -130,6 +135,58 @@ static struct {
 } istick;
 
 static bool scan_running;
+
+/*
+ * The BLE scanner is a single global resource shared with hogp_central.c, which
+ * runs a 3-second reconnect scan every ~8 seconds hunting for bonded pointing
+ * devices. When it stops its scan it stops OURS too -- and since inputstick_start()
+ * refuses to act unless the state is IDLE, we would sit in SCANNING forever with
+ * no scanner running, blinking at the user while doing nothing. Re-arm on a timer
+ * for as long as we still want a dongle.
+ */
+static void is_scan_retry_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(scan_retry_work, is_scan_retry_handler);
+
+/*
+ * Every transient state used to be a dead end: a connect that never completed,
+ * or a discovery that stalled, left us stuck with the LED blinking and no way
+ * back short of pressing the key again. Since the console has proven unusable
+ * for watching this live, the state machine has to heal itself.
+ */
+static void is_watchdog_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(watchdog_work, is_watchdog_handler);
+
+static void is_watchdog_handler(struct k_work *work) {
+    if (istick.state == IS_STATE_READY || istick.state == IS_STATE_IDLE) {
+        return;
+    }
+
+    LOG_WRN("stuck in state %d, giving up and rescanning", istick.state);
+
+    if (istick.conn) {
+        bt_conn_disconnect(istick.conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+        /* is_disconnected() puts us back to SCANNING and re-arms. */
+    } else {
+        istick.state = IS_STATE_SCANNING;
+        k_work_reschedule(&scan_retry_work, K_NO_WAIT);
+    }
+}
+
+static void is_scan_retry_handler(struct k_work *work) {
+    if (istick.state != IS_STATE_SCANNING) {
+        return; /* connected, or deliberately stopped */
+    }
+
+    int err = bt_le_scan_start(BT_LE_SCAN_ACTIVE, NULL);
+    if (err == 0) {
+        LOG_DBG("scan re-armed after being stopped by another user");
+        scan_running = true;
+    } else if (err != -EALREADY) {
+        LOG_WRN("scan re-arm failed (err %d)", err);
+    }
+
+    k_work_reschedule(&scan_retry_work, K_SECONDS(2));
+}
 
 /* ── target slots ─────────────────────────────────────────────────────────── */
 
@@ -260,6 +317,11 @@ static void is_write_cb(struct bt_conn *conn, uint8_t err, struct bt_gatt_write_
 static int is_write_raw(const uint8_t *data, uint16_t len) {
     if (!istick.conn || !istick.write_handle) {
         return -ENOTCONN;
+    }
+
+    if (!istick.write_acked) {
+        /* No ATT response comes back, so there is nothing to wait on. */
+        return bt_gatt_write_without_response(istick.conn, istick.write_handle, data, len, false);
     }
 
     memset(&istick.write_params, 0, sizeof(istick.write_params));
@@ -480,17 +542,26 @@ static void is_handshake(void) {
     }
 
     /*
-     * Fail loudly rather than reporting a connection that cannot type. The JS
-     * prototype used to mark itself connected here unconditionally and every
-     * later command failed with a swallowed error.
+     * Only a missing firmware version is fatal -- that means the dongle never
+     * answered FW_INFO and the link is genuinely unusable.
+     *
+     * A missing HID_STATUS is NOT fatal. The hardware-verified Python
+     * reference finishes its init sequence regardless of whether a status
+     * broadcast turned up; the dongle pushes those on its own timer and may
+     * simply not have sent one yet. Treating that as failure made us
+     * disconnect from a perfectly good dongle and go back to blinking, which
+     * is exactly the symptom seen at the bench.
      */
-    if (istick.fw_version == 0 || !istick.got_status) {
-        LOG_ERR("handshake incomplete (fw=%d status=%d) -- not usable", istick.fw_version,
-                istick.got_status);
+    if (istick.fw_version == 0) {
+        LOG_ERR("no firmware version from FW_INFO -- link not usable");
         goto fail;
+    }
+    if (!istick.got_status) {
+        LOG_WRN("no HID_STATUS yet; continuing anyway (dongle sends these on its own timer)");
     }
 
     istick.state = IS_STATE_READY;
+    k_work_cancel_delayable(&watchdog_work);
     LOG_INF("=== InputStick READY (fw %d) ===", istick.fw_version);
     return;
 
@@ -594,9 +665,12 @@ static uint8_t is_discover_cb(struct bt_conn *conn, const struct bt_gatt_attr *a
     const struct bt_uuid *want_notify =
         istick.legacy_hm ? &hm_rxtx_uuid.uuid : &nus_notify_uuid.uuid;
 
-    if (!bt_uuid_cmp(chrc->uuid, want_write) && (chrc->properties & BT_GATT_CHRC_WRITE)) {
+    if (!bt_uuid_cmp(chrc->uuid, want_write) &&
+        (chrc->properties & (BT_GATT_CHRC_WRITE | BT_GATT_CHRC_WRITE_WITHOUT_RESP))) {
         istick.write_handle = chrc->value_handle;
-        LOG_INF("write characteristic at 0x%04x", istick.write_handle);
+        istick.write_acked = (chrc->properties & BT_GATT_CHRC_WRITE) != 0;
+        LOG_INF("write characteristic at 0x%04x (%s)", istick.write_handle,
+                istick.write_acked ? "acked" : "unacked");
     }
     if (!bt_uuid_cmp(chrc->uuid, want_notify) && (chrc->properties & BT_GATT_CHRC_NOTIFY)) {
         istick.notify_handle = chrc->value_handle;
@@ -721,8 +795,11 @@ static void is_scan_recv(const struct bt_le_scan_recv_info *info, struct net_buf
     err = bt_conn_le_create(info->addr, BT_CONN_LE_CREATE_CONN, BT_LE_CONN_PARAM_DEFAULT,
                             &istick.conn);
     if (err) {
-        LOG_ERR("connect failed (err %d)", err);
-        istick.state = IS_STATE_IDLE;
+        LOG_ERR("connect failed (err %d), back to scanning", err);
+        istick.state = IS_STATE_SCANNING;
+        k_work_reschedule(&scan_retry_work, K_SECONDS(1));
+    } else {
+        k_work_reschedule(&watchdog_work, K_SECONDS(20));
     }
 }
 
@@ -743,14 +820,16 @@ static void is_connected(struct bt_conn *conn, uint8_t err) {
     }
 
     if (err) {
-        LOG_ERR("connection failed (err %d)", err);
+        LOG_ERR("connection failed (err %d), back to scanning", err);
         bt_conn_unref(istick.conn);
         istick.conn = NULL;
-        istick.state = IS_STATE_IDLE;
+        istick.state = IS_STATE_SCANNING;
+        k_work_reschedule(&scan_retry_work, K_SECONDS(1));
         return;
     }
 
     LOG_INF("connected to InputStick dongle");
+    k_work_cancel_delayable(&scan_retry_work);
     /*
      * No bt_conn_set_security() here: the dongle uses no pairing at all, so
      * asking for L2 only invites a needless SMP round trip (and a bond slot we
@@ -773,6 +852,11 @@ static void is_disconnected(struct bt_conn *conn, uint8_t reason) {
     istick.rx_len = 0;
     istick.fw_version = 0;
     istick.got_status = false;
+
+    /* Go back to hunting so the target recovers by itself -- the LED returns
+     * to fast-blink and reconnects when the dongle comes back. */
+    istick.state = IS_STATE_SCANNING;
+    k_work_reschedule(&scan_retry_work, K_SECONDS(1));
 }
 
 static struct bt_conn_cb is_conn_callbacks = {
@@ -793,8 +877,9 @@ void inputstick_start(void) {
     int err = bt_le_scan_start(BT_LE_SCAN_ACTIVE, NULL);
     if (err == -EALREADY) {
         /* HOGP pairing mode already has the scanner up; we share its reports. */
-        LOG_INF("scanner already running (HOGP pairing?), reusing it");
+        LOG_INF("scanner already running (HOGP?), reusing it");
         scan_running = true;
+        k_work_reschedule(&scan_retry_work, K_SECONDS(2));
         return;
     }
     if (err) {
@@ -805,6 +890,7 @@ void inputstick_start(void) {
 
     scan_running = true;
     LOG_INF("scanning for InputStick dongles...");
+    k_work_reschedule(&scan_retry_work, K_SECONDS(2));
 }
 
 int inputstick_select_slot(uint8_t slot) {
@@ -847,6 +933,8 @@ int inputstick_clear_slot(uint8_t slot) {
 }
 
 void inputstick_stop(void) {
+    k_work_cancel_delayable(&scan_retry_work);
+    k_work_cancel_delayable(&watchdog_work);
     if (scan_running) {
         bt_le_scan_stop();
         scan_running = false;
