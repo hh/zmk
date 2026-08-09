@@ -170,13 +170,35 @@ static int send_keyboard_report(void) {
 
 #if IS_ENABLED(CONFIG_ZMK_INPUTSTICK)
     case ZMK_TRANSPORT_INPUTSTICK: {
-        /* The dongle speaks the 8-byte USB boot keyboard report, which is
-         * exactly what HKRO produces: modifier byte, reserved, then up to 6
-         * keycodes. Pass the body straight through. NKRO builds use a bitmap
-         * instead and cannot be forwarded without translation. */
         struct zmk_hid_keyboard_report *keyboard_report = zmk_hid_get_keyboard_report();
+#if IS_ENABLED(CONFIG_ZMK_HID_REPORT_TYPE_NKRO)
+        /*
+         * NKRO stores held keys as a BITMAP -- keys[i] bit j means usage code
+         * i*8+j -- while the dongle speaks the 8-byte USB boot report, which
+         * wants an actual list of keycodes. Forwarding the bitmap bytes
+         * verbatim sends the dongle nonsense that is mostly zeros, i.e. "no
+         * keys pressed", so a correctly connected dongle types nothing at all.
+         *
+         * (zmk_hid_get_boot_report() does this conversion already but is gated
+         * behind CONFIG_ZMK_USB_BOOT, which we do not want to turn on just for
+         * its side effects on the USB stack.)
+         */
+        uint8_t keys[6] = {0};
+        size_t n = 0;
+        for (size_t i = 0; i < sizeof(keyboard_report->body.keys) && n < ARRAY_SIZE(keys); i++) {
+            uint8_t bits = keyboard_report->body.keys[i];
+            while (bits && n < ARRAY_SIZE(keys)) {
+                int bit = __builtin_ctz(bits);
+                keys[n++] = (uint8_t)(i * 8 + bit);
+                bits &= (uint8_t)(bits - 1);
+            }
+        }
+        return inputstick_send_keys(keyboard_report->body.modifiers, keys, n);
+#else
+        /* HKRO already is the boot layout: modifiers, reserved, 6 keycodes. */
         return inputstick_send_keys(keyboard_report->body.modifiers, keyboard_report->body.keys,
                                     sizeof(keyboard_report->body.keys));
+#endif
     }
 #endif
     }
