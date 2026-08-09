@@ -123,6 +123,10 @@ static struct {
     bool got_status;
 
     struct bt_gatt_discover_params discover_params;
+    /* The characteristic phase MUST NOT reuse discover_params: it is started
+     * from inside the service phase's own callback, while Zephyr still owns
+     * that struct for the in-flight procedure. */
+    struct bt_gatt_discover_params chrc_discover_params;
     struct bt_gatt_discover_params sub_discover_params;
     struct bt_gatt_subscribe_params subscribe_params;
     struct bt_gatt_write_params write_params;
@@ -587,14 +591,49 @@ K_THREAD_DEFINE(inputstick_tid, CONFIG_ZMK_INPUTSTICK_THREAD_STACK_SIZE, is_thre
 
 /* ── GATT discovery ──────────────────────────────────────────────────────── */
 
+/*
+ * Both of these are triggered from inside a GATT discovery callback. Starting a
+ * new GATT procedure there is asking for trouble -- the stack is still walking
+ * the previous one. Bounce through the system workqueue so each procedure
+ * starts with the previous one fully finished.
+ */
+static void is_discover_chrc_work_handler(struct k_work *work);
+static void is_subscribe_work_handler(struct k_work *work);
+static K_WORK_DEFINE(discover_chrc_work, is_discover_chrc_work_handler);
+static K_WORK_DEFINE(subscribe_work, is_subscribe_work_handler);
+
+static void is_subscribe_cb(struct bt_conn *conn, uint8_t err,
+                            struct bt_gatt_subscribe_params *params) {
+    /* bt_gatt_subscribe() returning 0 only means the request was queued; the
+     * CCC write completes later. Without this we logged "subscribed" before
+     * knowing whether notifications were actually enabled -- and a dongle that
+     * never got its CCC written will never answer RUN_FW. */
+    if (err) {
+        LOG_ERR("CCC write failed (att err 0x%02x) -- notifications are NOT enabled", err);
+    } else {
+        LOG_INF("CCC written, notifications enabled");
+    }
+}
+
 static void is_subscribe(void) {
     memset(&istick.subscribe_params, 0, sizeof(istick.subscribe_params));
     istick.subscribe_params.notify = is_notify_cb;
+    istick.subscribe_params.subscribe = is_subscribe_cb;
     istick.subscribe_params.value = BT_GATT_CCC_NOTIFY;
     istick.subscribe_params.value_handle = istick.notify_handle;
     istick.subscribe_params.ccc_handle = 0; /* auto-discovered, see BT_GATT_AUTO_DISCOVER_CCC */
     istick.subscribe_params.disc_params = &istick.sub_discover_params;
-    istick.subscribe_params.end_handle = istick.service_end_handle;
+    /* Clamp: an 0xffff end handle makes the CCC auto-discovery sweep every
+     * remaining attribute on the device. The CCC sits immediately after its
+     * characteristic value, so a short window is plenty. */
+    istick.subscribe_params.end_handle =
+        (istick.service_end_handle == 0xffff || istick.service_end_handle == 0)
+            ? (uint16_t)(istick.notify_handle + 8)
+            : istick.service_end_handle;
+
+    if (!istick.conn) {
+        return;
+    }
 
     int err = bt_gatt_subscribe(istick.conn, &istick.subscribe_params);
     if (err && err != -EALREADY) {
@@ -634,7 +673,7 @@ static uint8_t is_discover_cb(struct bt_conn *conn, const struct bt_gatt_attr *a
 
         /* Characteristic phase finished. */
         if (istick.write_handle && istick.notify_handle) {
-            is_subscribe();
+            k_work_submit(&subscribe_work);
         } else {
             LOG_ERR("missing characteristics (write=0x%04x notify=0x%04x)", istick.write_handle,
                     istick.notify_handle);
@@ -655,7 +694,7 @@ static uint8_t is_discover_cb(struct bt_conn *conn, const struct bt_gatt_attr *a
          * returning CONTINUE -- same reasoning as hogp_central.c, where
          * continuing races incoming ATT traffic from the peer.
          */
-        is_discover_characteristics();
+        k_work_submit(&discover_chrc_work);
         return BT_GATT_ITER_STOP;
     }
 
@@ -668,7 +707,15 @@ static uint8_t is_discover_cb(struct bt_conn *conn, const struct bt_gatt_attr *a
     if (!bt_uuid_cmp(chrc->uuid, want_write) &&
         (chrc->properties & (BT_GATT_CHRC_WRITE | BT_GATT_CHRC_WRITE_WITHOUT_RESP))) {
         istick.write_handle = chrc->value_handle;
-        istick.write_acked = (chrc->properties & BT_GATT_CHRC_WRITE) != 0;
+        /*
+         * Prefer write-WITHOUT-response. The dongle advertises the WRITE
+         * property, so ATT Write Requests are accepted at the protocol level
+         * and returned no error -- yet RUN_FW never got an answer. The
+         * hardware-verified Python reference writes response=False for every
+         * packet, so match it rather than trusting the advertised property.
+         * Only fall back to acked writes if unacked is not supported at all.
+         */
+        istick.write_acked = (chrc->properties & BT_GATT_CHRC_WRITE_WITHOUT_RESP) == 0;
         LOG_INF("write characteristic at 0x%04x (%s)", istick.write_handle,
                 istick.write_acked ? "acked" : "unacked");
     }
@@ -677,24 +724,45 @@ static uint8_t is_discover_cb(struct bt_conn *conn, const struct bt_gatt_attr *a
         LOG_INF("notify characteristic at 0x%04x", istick.notify_handle);
     }
 
+    /*
+     * Stop as soon as we have both handles rather than waiting for discovery to
+     * run to completion. This dongle reports its NUS service as 0x000b-0xffff,
+     * so the characteristic walk runs to the end of the attribute table and the
+     * terminating attr==NULL callback never arrived -- discovery sat there until
+     * the watchdog killed the connection, with both handles already in hand.
+     * There is nothing after these two that we need.
+     */
+    if (istick.write_handle && istick.notify_handle) {
+        LOG_INF("both handles found, subscribing without waiting for discovery to end");
+        k_work_submit(&subscribe_work);
+        return BT_GATT_ITER_STOP;
+    }
+
     return BT_GATT_ITER_CONTINUE;
 }
 
 static void is_discover_characteristics(void) {
-    istick.discover_phase = IS_DISC_CHARACTERISTICS;
-    memset(&istick.discover_params, 0, sizeof(istick.discover_params));
-    istick.discover_params.uuid = NULL; /* all characteristics in the service */
-    istick.discover_params.func = is_discover_cb;
-    istick.discover_params.start_handle = istick.service_start_handle;
-    istick.discover_params.end_handle = istick.service_end_handle;
-    istick.discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
+    if (!istick.conn) {
+        return;
+    }
 
-    int err = bt_gatt_discover(istick.conn, &istick.discover_params);
+    istick.discover_phase = IS_DISC_CHARACTERISTICS;
+    memset(&istick.chrc_discover_params, 0, sizeof(istick.chrc_discover_params));
+    istick.chrc_discover_params.uuid = NULL; /* all characteristics in the service */
+    istick.chrc_discover_params.func = is_discover_cb;
+    istick.chrc_discover_params.start_handle = istick.service_start_handle;
+    istick.chrc_discover_params.end_handle = istick.service_end_handle;
+    istick.chrc_discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
+
+    int err = bt_gatt_discover(istick.conn, &istick.chrc_discover_params);
     if (err) {
         LOG_ERR("characteristic discovery failed (err %d)", err);
         bt_conn_disconnect(istick.conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
     }
 }
+
+static void is_discover_chrc_work_handler(struct k_work *work) { is_discover_characteristics(); }
+static void is_subscribe_work_handler(struct k_work *work) { is_subscribe(); }
 
 static void is_start_discovery(void) {
     istick.state = IS_STATE_DISCOVERING;
