@@ -110,6 +110,28 @@ config ZMK_INPUTSTICK_SLOT_COUNT
       These are NOT bonds -- an InputStick needs no pairing -- so unlike BLE
       profiles they cost nothing from CONFIG_BT_MAX_PAIRED.
 
+config ZMK_INPUTSTICK_TX_QUEUE_SIZE
+    int "Queued HID reports awaiting transmission"
+    default 16
+    help
+      Depth of the HID report queue drained by the InputStick TX thread.
+      Overflow drops the OLDEST report: a stale HID report is worthless, and
+      applying back pressure to keyscan or the BT RX thread is the thing this
+      queue exists to prevent.
+
+config ZMK_INPUTSTICK_TX_STACK_SIZE
+    int "InputStick TX work queue stack size"
+    default 2048
+    help
+      Stack for the thread that performs the GATT writes.
+
+config ZMK_INPUTSTICK_TX_THREAD_PRIORITY
+    int "InputStick TX work queue thread priority"
+    default 5
+    help
+      Preemptible, and lower priority than the BT RX thread so transmission
+      never delays reception.
+
 config ZMK_INPUTSTICK_THREAD_STACK_SIZE
     int "InputStick handshake thread stack size"
     default 2048

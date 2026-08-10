@@ -156,7 +156,101 @@ static bool scan_running;
  * Counting what the endpoint layer actually hands us settles it from inside
  * the firmware, without capturing anyone's keystrokes.
  */
-static uint32_t kb_reports_sent, mouse_reports_sent, send_errors;
+static uint32_t kb_reports_sent, mouse_reports_sent, send_errors, tx_dropped;
+
+/* ── deferred TX ──────────────────────────────────────────────────────────────
+ *
+ * HID reports MUST NOT be sent from the caller's thread. Two callers, both
+ * fatal if blocked:
+ *
+ *   keyboard -> zmk_endpoints_send_report() runs on the SYSTEM WORKQUEUE,
+ *               reached synchronously from keyscan. Blocking there stops the
+ *               matrix being scanned at all -- a press+release inside the
+ *               window is never seen -- and stalls split-half events into a
+ *               5-deep queue that then silently drops them.
+ *
+ *   mouse    -> arrives on a HOGP notification callback, i.e. the BLUETOOTH RX
+ *               THREAD. With acked writes the ATT Write Response that would
+ *               release write_done_sem is dispatched BY that very thread, so it
+ *               can never fire: a guaranteed 2s timeout per write, two writes
+ *               per packet, ~4s of completely dead BLE stack per mouse report
+ *               across all links. Zephyr documents this hazard in
+ *               bluetooth/gatt.h.
+ *
+ * So: copy the report into a queue, hand off to a DEDICATED work queue, and do
+ * all GATT there. Exactly what zmk_hog_send_keyboard_report() does in hog.c.
+ * Drop-oldest on overflow, because a stale HID report is worthless and back
+ * pressure onto keyscan is precisely what must be avoided.
+ */
+
+static int is_send_packet(uint8_t cmd, uint8_t param, const uint8_t *data, size_t data_len,
+                          bool respond, uint8_t *resp_out, size_t *resp_out_len);
+
+#define IS_TX_MAX_DATA 24 /* three 8-byte keyboard reports */
+
+struct is_tx_item {
+    uint8_t cmd;
+    uint8_t param;
+    uint8_t len;
+    uint8_t data[IS_TX_MAX_DATA];
+};
+
+K_MSGQ_DEFINE(is_tx_msgq, sizeof(struct is_tx_item), CONFIG_ZMK_INPUTSTICK_TX_QUEUE_SIZE, 4);
+static K_THREAD_STACK_DEFINE(is_tx_stack, CONFIG_ZMK_INPUTSTICK_TX_STACK_SIZE);
+static struct k_work_q is_tx_work_q;
+
+static void is_tx_work_handler(struct k_work *work);
+static K_WORK_DEFINE(is_tx_work, is_tx_work_handler);
+
+/* Never blocks. Safe from the system workqueue and the BT RX thread. */
+static int is_tx_enqueue(uint8_t cmd, uint8_t param, const uint8_t *data, size_t len) {
+    if (len > IS_TX_MAX_DATA) {
+        return -EINVAL;
+    }
+
+    struct is_tx_item item = {.cmd = cmd, .param = param, .len = (uint8_t)len};
+    if (len) {
+        memcpy(item.data, data, len);
+    }
+
+    if (k_msgq_put(&is_tx_msgq, &item, K_NO_WAIT) != 0) {
+        struct is_tx_item stale;
+        if (k_msgq_get(&is_tx_msgq, &stale, K_NO_WAIT) == 0) {
+            tx_dropped++;
+        }
+        if (k_msgq_put(&is_tx_msgq, &item, K_NO_WAIT) != 0) {
+            tx_dropped++;
+            return -ENOMEM;
+        }
+    }
+
+    k_work_submit_to_queue(&is_tx_work_q, &is_tx_work);
+    return 0;
+}
+
+static void is_tx_work_handler(struct k_work *work) {
+    struct is_tx_item item;
+
+    while (k_msgq_get(&is_tx_msgq, &item, K_NO_WAIT) == 0) {
+        if (!inputstick_is_ready()) {
+            send_errors++;
+            continue;
+        }
+
+        int err = is_send_packet(item.cmd, item.param, item.data, item.len, false, NULL, NULL);
+        if (err) {
+            /* Logged here and nowhere else: the endpoint layer discards our
+             * return value, so without this a failing dongle is completely
+             * silent. */
+            LOG_ERR("TX failed for cmd 0x%02x (err %d)", item.cmd, err);
+            send_errors++;
+        } else if (item.cmd == IS_CMD_HID_DATA_KEYB) {
+            kb_reports_sent++;
+        } else if (item.cmd == IS_CMD_HID_DATA_MOUSE) {
+            mouse_reports_sent++;
+        }
+    }
+}
 
 /*
  * The BLE scanner is a single global resource shared with hogp_central.c, which
@@ -1120,8 +1214,8 @@ void inputstick_print_status(void) {
     } else {
         printk("Dongle: (not connected)\n");
     }
-    printk("Sent: %u keyboard, %u mouse, %u errors\n", kb_reports_sent, mouse_reports_sent,
-           send_errors);
+    printk("Sent: %u keyboard, %u mouse, %u errors, %u dropped\n", kb_reports_sent,
+           mouse_reports_sent, send_errors, tx_dropped);
     printk("Endpoint: %s\n",
            zmk_endpoints_selected().transport == ZMK_TRANSPORT_INPUTSTICK
                ? "INPUTSTICK (keystrokes routed here)"
@@ -1144,13 +1238,7 @@ int inputstick_send_keys(uint8_t modifier, const uint8_t *keycodes, size_t count
         report[2 + i] = keycodes[i];
     }
 
-    int err = is_send_packet(IS_CMD_HID_DATA_KEYB, 1, report, sizeof(report), false, NULL, NULL);
-    if (err) {
-        send_errors++;
-    } else {
-        kb_reports_sent++;
-    }
-    return err;
+    return is_tx_enqueue(IS_CMD_HID_DATA_KEYB, 1, report, sizeof(report));
 }
 
 int inputstick_send_mouse(uint8_t buttons, int8_t x, int8_t y, int8_t wheel) {
@@ -1159,13 +1247,7 @@ int inputstick_send_mouse(uint8_t buttons, int8_t x, int8_t y, int8_t wheel) {
     }
 
     uint8_t report[4] = {buttons, (uint8_t)x, (uint8_t)y, (uint8_t)wheel};
-    int err = is_send_packet(IS_CMD_HID_DATA_MOUSE, 1, report, sizeof(report), false, NULL, NULL);
-    if (err) {
-        send_errors++;
-    } else {
-        mouse_reports_sent++;
-    }
-    return err;
+    return is_tx_enqueue(IS_CMD_HID_DATA_MOUSE, 1, report, sizeof(report));
 }
 
 int inputstick_type(const char *text) {
@@ -1221,6 +1303,11 @@ static void is_boot_resume_handler(struct k_work *work) {
 static K_WORK_DELAYABLE_DEFINE(boot_resume_work, is_boot_resume_handler);
 
 static int inputstick_init(void) {
+    k_work_queue_init(&is_tx_work_q);
+    k_work_queue_start(&is_tx_work_q, is_tx_stack, K_THREAD_STACK_SIZEOF(is_tx_stack),
+                       CONFIG_ZMK_INPUTSTICK_TX_THREAD_PRIORITY, NULL);
+    k_thread_name_set(&is_tx_work_q.thread, "istick_tx");
+
     bt_conn_cb_register(&is_conn_callbacks);
     bt_le_scan_cb_register(&is_scan_cb);
     istick.state = IS_STATE_IDLE;
