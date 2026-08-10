@@ -117,6 +117,13 @@ int zmk_endpoints_select_transport(enum zmk_transport transport) {
     LOG_DBG("Selected endpoint transport %d", transport);
 
     if (preferred_transport == transport) {
+        /* Do NOT early-return. preferred_transport is persisted and restored at
+         * boot, so after a reboot it already equals the requested transport and
+         * returning here skips update_current_endpoint() entirely -- leaving
+         * current_instance on whatever was selected at startup. Pressing the
+         * target key then does nothing at all, while the indicator happily
+         * shows the target. Recompute and get out. */
+        update_current_endpoint();
         return 0;
     }
 
@@ -337,6 +344,14 @@ int zmk_endpoints_send_trackpad_report() {
         return -ENOTSUP;
 #endif /* IS_ENABLED(CONFIG_ZMK_BLE) */
     }
+
+#if IS_ENABLED(CONFIG_ZMK_INPUTSTICK)
+    case ZMK_TRANSPORT_INPUTSTICK:
+        /* The dongle has no trackpad interface wired up here. Return quietly
+         * rather than hitting the "Unhandled endpoint transport" error below on
+         * every single trackpad report. */
+        return -ENOTSUP;
+#endif
     }
 
     LOG_ERR("Unhandled endpoint transport %d", current_instance.transport);
@@ -408,8 +423,20 @@ static enum zmk_transport get_selected_transport(void) {
 
     if (is_ble_ready()) {
         if (is_usb_ready()) {
-            LOG_DBG("Both endpoint transports are ready. Using %d", preferred_transport);
-            return preferred_transport;
+            /* Both ready: honour the preference -- but NOT if the preference is
+             * a transport we already rejected above as unready. Returning
+             * INPUTSTICK here would route reports to a dongle that is not
+             * connected, and inputstick_send_keys() would drop every one of
+             * them with -ENOTCONN. Keystrokes would vanish entirely rather
+             * than falling back. */
+            enum zmk_transport pref = preferred_transport;
+#if IS_ENABLED(CONFIG_ZMK_INPUTSTICK)
+            if (pref == ZMK_TRANSPORT_INPUTSTICK) {
+                pref = ZMK_TRANSPORT_USB;
+            }
+#endif
+            LOG_DBG("Both endpoint transports are ready. Using %d", pref);
+            return pref;
         }
 
         LOG_DBG("Only BLE is ready.");
@@ -486,6 +513,8 @@ static void update_current_endpoint(void) {
         raise_zmk_endpoint_changed((struct zmk_endpoint_changed){.endpoint = current_instance});
     }
 }
+
+void zmk_endpoints_refresh(void) { update_current_endpoint(); }
 
 static int endpoint_listener(const zmk_event_t *eh) {
     update_current_endpoint();

@@ -92,3 +92,13 @@ int zmk_endpoints_send_trackpad_report();
 #endif
 
 void zmk_endpoints_clear_current(void);
+
+/**
+ * Recompute which endpoint is selected.
+ *
+ * Needed by transports whose readiness changes outside the USB/BLE events the
+ * endpoint listener subscribes to -- an InputStick dongle finishes its
+ * handshake seconds after the user selects it, and without this the selection
+ * made at keypress time (when it was not yet ready) stays latched forever.
+ */
+void zmk_endpoints_refresh(void);

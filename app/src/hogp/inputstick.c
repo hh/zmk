@@ -46,6 +46,7 @@
 
 #include <string.h>
 
+#include <zmk/endpoints.h>
 #include <zmk/hogp/inputstick.h>
 
 LOG_MODULE_REGISTER(inputstick, CONFIG_ZMK_INPUTSTICK_LOG_LEVEL);
@@ -66,6 +67,13 @@ LOG_MODULE_REGISTER(inputstick, CONFIG_ZMK_INPUTSTICK_LOG_LEVEL);
 #define IS_CMD_HID_DATA_KEYB 0x21
 #define IS_CMD_HID_DATA_MOUSE 0x23
 #define IS_CMD_HID_STATUS 0x2f
+#define IS_RESP_OK 0x01
+
+/* HID_STATUS body[1]: 0x05 means the dongle is USB-enumerated AND configured.
+ * Anything else and it buffers HID reports and types nothing -- unpowered hub,
+ * charger-only port, sleeping host. Per the vendor SDK this is the gate for
+ * STATE_READY. */
+#define IS_HID_STATE_READY 0x05
 
 #define IS_MOD_LSHIFT 0x02
 
@@ -121,6 +129,7 @@ static struct {
 
     uint16_t fw_version;
     bool got_status;
+    uint8_t hid_state; /* HID_STATUS body[1]; IS_HID_STATE_READY when usable */
 
     struct bt_gatt_discover_params discover_params;
     /* The characteristic phase MUST NOT reuse discover_params: it is started
@@ -139,6 +148,15 @@ static struct {
 } istick;
 
 static bool scan_running;
+
+/*
+ * Report counters. With the dongle plugged into the same machine as the
+ * keyboard, "text appeared" cannot distinguish output that went through the
+ * dongle from output that went out USB/BLE -- both land on the same screen.
+ * Counting what the endpoint layer actually hands us settles it from inside
+ * the firmware, without capturing anyone's keystrokes.
+ */
+static uint32_t kb_reports_sent, mouse_reports_sent, send_errors;
 
 /*
  * The BLE scanner is a single global resource shared with hogp_central.c, which
@@ -420,7 +438,8 @@ static void is_handle_body(const uint8_t *body, size_t len) {
 
     if (body[0] == IS_CMD_HID_STATUS) {
         istick.got_status = true;
-        LOG_DBG("HID_STATUS received");
+        istick.hid_state = (len > 1) ? body[1] : 0;
+        LOG_DBG("HID_STATUS state=0x%02x", istick.hid_state);
         return;
     }
 
@@ -523,18 +542,45 @@ static void is_handshake(void) {
 
     resp_len = 0;
     err = is_send_packet(IS_CMD_FW_INFO, 0, NULL, 0, true, resp, &resp_len);
-    if (err == 0 && resp_len >= 4 && resp[0] == IS_CMD_FW_INFO) {
-        istick.fw_version = ((uint16_t)resp[2] << 8) | resp[3];
-        LOG_INF("dongle firmware version %d", istick.fw_version);
+    if (err == 0 && resp_len >= 5 && resp[0] == IS_CMD_FW_INFO) {
+        /* Vendor layout (DeviceInfo.java): [2]=firmwareType [3]=major [4]=minor,
+         * version = major*100 + minor. The ports decode this as
+         * (resp[2] << 8) | resp[3], which is simply wrong -- it yields garbage
+         * like 16897, decides the SET_UPDATE_INTERVAL >= 100 gate at random,
+         * and computes 0 for a working dongle whose firmwareType and major are
+         * both 0, which we then treat as fatal. */
+        istick.fw_version = (uint16_t)(resp[3] * 100 + resp[4]);
+        LOG_INF("dongle firmware %d (type %d, v%d.%d)", istick.fw_version, resp[2], resp[3],
+                resp[4]);
+        if (resp_len >= 21 && resp[20] != 0) {
+            LOG_ERR("dongle is PASSWORD PROTECTED (security 0x%02x) -- plain INIT will be "
+                    "rejected; encrypted INIT_AUTH is not implemented",
+                    resp[19]);
+        }
     } else {
-        LOG_WRN("FW_INFO did not return a version");
+        LOG_WRN("FW_INFO did not return a usable version");
     }
 
-    err = is_send_packet(IS_CMD_INIT, 0, NULL, 0, true, NULL, NULL);
+    resp_len = 0;
+    err = is_send_packet(IS_CMD_INIT, 0, NULL, 0, true, resp, &resp_len);
     if (err) {
-        LOG_ERR("INIT failed (err %d)", err);
+        LOG_ERR("INIT got no response (err %d)", err);
         goto fail;
     }
+    /*
+     * A dongle that REFUSES init still answers, so err==0 proves nothing. The
+     * vendor SDK gates on respCode == RESP_OK and treats 0x20/0x21/0xFF as
+     * failure. Declaring READY over a refused init produces exactly the
+     * observed symptom: well-framed packets accepted with valid CRCs, and
+     * every HID report silently discarded.
+     */
+    if (resp_len >= 2 && resp[1] != IS_RESP_OK) {
+        LOG_ERR("INIT REFUSED by dongle (resp 0x%02x) -- it will accept packets and ignore all "
+                "HID data",
+                resp[1]);
+        goto fail;
+    }
+    LOG_INF("INIT accepted");
 
     if (istick.fw_version >= 100) {
         is_send_packet(IS_CMD_SET_UPDATE_INTERVAL, 5, NULL, 0, true, NULL, NULL);
@@ -560,13 +606,33 @@ static void is_handshake(void) {
         LOG_ERR("no firmware version from FW_INFO -- link not usable");
         goto fail;
     }
+    /*
+     * Require a HID_STATUS saying the dongle is USB-enumerated and configured.
+     * Earlier this was relaxed to a warning on the strength of the Python
+     * reference -- but the JS reference and the vendor SDK both refuse READY
+     * without it, and relaxing it removed the one signal that distinguishes
+     * "connected and working" from "connected to a dongle in a dead USB port".
+     */
     if (!istick.got_status) {
-        LOG_WRN("no HID_STATUS yet; continuing anyway (dongle sends these on its own timer)");
+        LOG_ERR("no HID_STATUS from dongle -- cannot confirm it is usable");
+        goto fail;
+    }
+    if (istick.hid_state != IS_HID_STATE_READY) {
+        LOG_ERR("dongle HID state 0x%02x (want 0x%02x) -- not USB-enumerated on its host; it "
+                "will buffer reports and type nothing",
+                istick.hid_state, IS_HID_STATE_READY);
+        goto fail;
     }
 
     istick.state = IS_STATE_READY;
     k_work_cancel_delayable(&watchdog_work);
     LOG_INF("=== InputStick READY (fw %d) ===", istick.fw_version);
+
+    /* Tell the endpoint layer to re-select. The user pressed the target key
+     * seconds ago, when this dongle was not ready -- endpoints fell back to
+     * USB/BLE and latched it. Without this the indicator goes solid while
+     * keystrokes keep going to the wrong machine. */
+    zmk_endpoints_refresh();
     return;
 
 fail:
@@ -937,6 +1003,9 @@ static void is_disconnected(struct bt_conn *conn, uint8_t reason) {
      * to fast-blink and reconnects when the dongle comes back. */
     istick.state = IS_STATE_SCANNING;
     k_work_reschedule(&scan_retry_work, K_SECONDS(1));
+
+    /* And fall back to USB/BLE now rather than typing into a dead link. */
+    zmk_endpoints_refresh();
 }
 
 static struct bt_conn_cb is_conn_callbacks = {
@@ -1046,11 +1115,17 @@ void inputstick_print_status(void) {
         bt_addr_le_to_str(&istick.addr, addr_str, sizeof(addr_str));
         printk("Dongle: %s (%s)\n", addr_str, istick.legacy_hm ? "HM-10" : "NUS");
         printk("Handles: write=0x%04x notify=0x%04x\n", istick.write_handle, istick.notify_handle);
-        printk("Firmware: %d  HID status seen: %s\n", istick.fw_version,
-               istick.got_status ? "yes" : "no");
+        printk("Firmware: %d  HID status: %s (state 0x%02x, want 0x%02x)\n", istick.fw_version,
+               istick.got_status ? "seen" : "NEVER", istick.hid_state, IS_HID_STATE_READY);
     } else {
         printk("Dongle: (not connected)\n");
     }
+    printk("Sent: %u keyboard, %u mouse, %u errors\n", kb_reports_sent, mouse_reports_sent,
+           send_errors);
+    printk("Endpoint: %s\n",
+           zmk_endpoints_selected().transport == ZMK_TRANSPORT_INPUTSTICK
+               ? "INPUTSTICK (keystrokes routed here)"
+               : "NOT inputstick -- keystrokes are going to USB/BLE");
     printk("==================\n");
 }
 
@@ -1069,7 +1144,13 @@ int inputstick_send_keys(uint8_t modifier, const uint8_t *keycodes, size_t count
         report[2 + i] = keycodes[i];
     }
 
-    return is_send_packet(IS_CMD_HID_DATA_KEYB, 1, report, sizeof(report), false, NULL, NULL);
+    int err = is_send_packet(IS_CMD_HID_DATA_KEYB, 1, report, sizeof(report), false, NULL, NULL);
+    if (err) {
+        send_errors++;
+    } else {
+        kb_reports_sent++;
+    }
+    return err;
 }
 
 int inputstick_send_mouse(uint8_t buttons, int8_t x, int8_t y, int8_t wheel) {
@@ -1078,7 +1159,13 @@ int inputstick_send_mouse(uint8_t buttons, int8_t x, int8_t y, int8_t wheel) {
     }
 
     uint8_t report[4] = {buttons, (uint8_t)x, (uint8_t)y, (uint8_t)wheel};
-    return is_send_packet(IS_CMD_HID_DATA_MOUSE, 1, report, sizeof(report), false, NULL, NULL);
+    int err = is_send_packet(IS_CMD_HID_DATA_MOUSE, 1, report, sizeof(report), false, NULL, NULL);
+    if (err) {
+        send_errors++;
+    } else {
+        mouse_reports_sent++;
+    }
+    return err;
 }
 
 int inputstick_type(const char *text) {
@@ -1117,10 +1204,27 @@ int inputstick_type(const char *text) {
     return 0;
 }
 
+/*
+ * The preferred transport survives a reboot in settings, so after a restart the
+ * keyboard can be pointed at a dongle while nothing is actually hunting for one
+ * -- the indicator sits there fast-blinking until someone presses the select
+ * key again. Deliberately delayed: settings have to load first, and there is no
+ * point scanning before the BLE stack is up.
+ */
+static void is_boot_resume_handler(struct k_work *work) {
+    if (zmk_endpoints_preferred_transport() != ZMK_TRANSPORT_INPUTSTICK) {
+        return;
+    }
+    LOG_INF("InputStick is the preferred transport, resuming hunt after boot");
+    inputstick_start();
+}
+static K_WORK_DELAYABLE_DEFINE(boot_resume_work, is_boot_resume_handler);
+
 static int inputstick_init(void) {
     bt_conn_cb_register(&is_conn_callbacks);
     bt_le_scan_cb_register(&is_scan_cb);
     istick.state = IS_STATE_IDLE;
+    k_work_reschedule(&boot_resume_work, K_SECONDS(5));
     LOG_INF("InputStick client initialised");
     return 0;
 }

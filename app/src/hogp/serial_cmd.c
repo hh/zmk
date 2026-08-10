@@ -159,8 +159,13 @@ static void process_command(const char *cmd) {
 
 #if IS_ENABLED(CONFIG_ZMK_INPUTSTICK)
     } else if (strncmp(cmd, "istick", 6) == 0) {
-        LOG_INF("Scanning for InputStick dongle...");
-        inputstick_start();
+        /* Select the transport too, not just connect. Connecting alone leaves
+         * preferred_transport untouched, so the dongle reaches READY and
+         * keystrokes still leave over USB/BLE -- which made every !istick test
+         * look like a failure of the feature rather than of the command. */
+        LOG_INF("Scanning for InputStick dongle and selecting it for output...");
+        inputstick_select_slot(0);
+        zmk_endpoints_select_transport(ZMK_TRANSPORT_INPUTSTICK);
 
     } else if (strncmp(cmd, "istop", 5) == 0) {
         inputstick_stop();

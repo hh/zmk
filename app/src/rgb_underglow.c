@@ -374,10 +374,23 @@ static void zmk_rgb_underglow_effect_kinesis() {
      * blink_step(0, 2) is the exact fast blink an unpaired BLE profile uses,
      * so an unbound dongle slot looks the same as an open profile.
      */
-    if (zmk_endpoints_preferred_transport() == ZMK_TRANSPORT_INPUTSTICK) {
-        if (inputstick_is_ready()) {
+    if (endpoint.transport == ZMK_TRANSPORT_INPUTSTICK ||
+        zmk_endpoints_preferred_transport() == ZMK_TRANSPORT_INPUTSTICK) {
+        /*
+         * SOLID means the endpoint layer has ACTUALLY selected the dongle, so
+         * this is the same value send_keyboard_report() switches on -- if it is
+         * solid, keystrokes are genuinely going there.
+         *
+         * The previous version keyed off preferred_transport and is_ready(),
+         * which went solid while reports were still leaving over USB/BLE: the
+         * selection had latched before the handshake finished. An indicator
+         * that disagrees with the report path is worse than none, because it
+         * gets believed.
+         */
+        if (endpoint.transport == ZMK_TRANSPORT_INPUTSTICK) {
             pixels[1] = INPUTSTICK_INDICATOR_COLOR;
         } else {
+            /* Wanted, but not actually carrying output yet. */
             bt_blinking = zmk_kinesis_blink_step(0, 2);
             pixels[1] = bt_blinking ? LED_RGB(0x000000) : INPUTSTICK_INDICATOR_COLOR;
         }
